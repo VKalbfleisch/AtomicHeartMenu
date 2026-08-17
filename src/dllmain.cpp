@@ -56,6 +56,12 @@ namespace
         PopulateModuleInfo();
         LOG("Game module base=%p size=0x%zX", (void*)G::moduleBase, G::moduleSize);
 
+        if (Offsets::ExpectedImageSize && G::moduleSize != Offsets::ExpectedImageSize)
+            LOG("WARNING: game image is 0x%zX, offsets.h was captured from 0x%zX -- the game "
+                "has been patched. The static RVAs are stale; resolution will fall back to the "
+                "signature scan. If that also fails, run tools/find_globals.py on this build.",
+                G::moduleSize, Offsets::ExpectedImageSize);
+
         if (!DX12Hook::Install())
             LOG("WARNING: DX12 hook install failed - menu will not draw.");
 
@@ -69,6 +75,10 @@ namespace
         bool sdkWarningLogged = false;
         ULONGLONG firstSdkAttemptMs = GetTickCount64();
         ULONGLONG lastSdkAttemptMs = 0;
+        // Retrying only helps while the engine is still coming up; past that the
+        // addresses are wrong for this build and the spam buries the diagnosis.
+        ULONGLONG sdkRetryDelayMs = 1000;
+        constexpr ULONGLONG kSdkRetryDelayCapMs = 30000;
         auto tryResolveSdk = [&]() -> bool
         {
             lastSdkAttemptMs = GetTickCount64();
@@ -89,12 +99,17 @@ namespace
         while (G::running.load())
         {
             ULONGLONG nowMs = GetTickCount64();
-            if (!sdkPrewarmed && nowMs - lastSdkAttemptMs > 1000)
+            if (!sdkPrewarmed && nowMs - lastSdkAttemptMs > sdkRetryDelayMs)
             {
-                tryResolveSdk();
+                if (!tryResolveSdk())
+                    sdkRetryDelayMs = (sdkRetryDelayMs * 2 > kSdkRetryDelayCapMs)
+                                        ? kSdkRetryDelayCapMs : sdkRetryDelayMs * 2;
+
                 if (!sdkPrewarmed && !sdkWarningLogged && nowMs - firstSdkAttemptMs > 10000)
                 {
-                    LOG_SDK("WARNING: not resolved yet - fix signatures/offsets in offsets.h if this persists.");
+                    LOG_SDK("WARNING: not resolved yet - run tools/find_globals.py against this "
+                            "game build and update offsets.h. Retrying every %llums from here.",
+                            sdkRetryDelayMs);
                     sdkWarningLogged = true;
                 }
             }

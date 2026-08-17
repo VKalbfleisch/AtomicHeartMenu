@@ -234,6 +234,7 @@ def main():
               "// TUObjectArray (not the outer FUObjectArray)")
         print(f"    constexpr uintptr_t GNames_RVA     = 0x{results['GNames']:08X}; // FNamePool")
         print(f"    constexpr uintptr_t GWorld_RVA     = 0x{results['GWorld']:08X}; // UWorld**")
+        print(f"    constexpr size_t ExpectedImageSize = 0x{image.size_of_image:X};")
         print("\nThen rebuild, inject, and confirm the log says "
               "\"ResolveGlobals: VALID\".")
 

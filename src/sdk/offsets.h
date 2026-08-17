@@ -46,6 +46,10 @@ namespace Offsets
     constexpr uintptr_t GNames_RVA     = 0x070F7BC0; // FNamePool
     constexpr uintptr_t GWorld_RVA     = 0x070F43C0; // UWorld**
 
+    // PE SizeOfImage (checked against G::moduleSize at injection) of the build the
+    // RVAs above came from, so a patched game is named as such. 0 disables it.
+    constexpr size_t ExpectedImageSize = 0x78F0000;
+
     // ---- AOB patterns (UE4.27 typical) ------------------------------------
     // GObjects: lea/ mov referencing the FUObjectArray (GUObjectArray).
     //   mov rcx, GUObjectArray ; ... pattern around StaticFindObject/AddObject.
