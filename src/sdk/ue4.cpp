@@ -544,6 +544,31 @@ void UE::UObject::ProcessEvent(UObject* function, void* params)
 // ---------------------------------------------------------------------------
 namespace
 {
+    // The object sweep below covers GObjects and GNames but never touches GWorld,
+    // so it gets its own check. Null is tolerated, not failed: the pointer really
+    // is null until a map loads. A wrong address reading as zero still slips past.
+    bool ValidateGWorld()
+    {
+        if (!Mem::IsReadable(g_GWorld, sizeof(UE::UObject*))) return false;
+
+        UE::UObject* world = *g_GWorld;
+        if (!world)
+        {
+            LOG("ValidateGWorld: null (no map loaded yet) -- unverified");
+            return true;
+        }
+        if (!Mem::IsReadable(world, 0x30)) return false;
+
+        UE::UObject* cls = world->Class();
+        if (!Mem::IsReadable(cls, 0x30)) return false;
+
+        std::string name = cls->GetName();
+        bool ok = (name == "World");
+        LOG("ValidateGWorld: *GWorld=%p class=%s -> %s", (void*)world, name.c_str(),
+            ok ? "ok" : "NOT a UWorld");
+        return ok;
+    }
+
     // Confirm GObjects+GNames really point at the engine by checking that the
     // first batch of objects resolve to the well-known core UE4 type names.
     // Garbage addresses will essentially never produce these strings.
@@ -568,36 +593,69 @@ namespace
                 ++coreHits;
         }
         LOG("ValidateSdk: checked=%d coreHits=%d", checked, coreHits);
-        return checked > 32 && coreHits >= 3;
+        return checked > 32 && coreHits >= 3 && ValidateGWorld();
+    }
+
+    bool ApplyStaticGlobals()
+    {
+        g_GObjects = G::moduleBase + Offsets::GObjects_RVA;
+        g_GNames   = G::moduleBase + Offsets::GNames_RVA;
+        g_GWorld   = reinterpret_cast<UE::UObject**>(G::moduleBase + Offsets::GWorld_RVA);
+        return true;
+    }
+
+    bool ApplyScannedGlobals()
+    {
+        g_GObjects = Scanner::FindRipRel(Offsets::SIG_GOBJECTS, 3, 7);
+        g_GNames   = Scanner::FindRipRel(Offsets::SIG_GNAMES,   3, 7);
+        g_GWorld   = reinterpret_cast<UE::UObject**>(Scanner::FindRipRel(Offsets::SIG_GWORLD, 3, 7));
+        return g_GObjects && g_GNames && g_GWorld;
+    }
+
+    bool TryGlobalsSource(bool useStatic)
+    {
+        const char* label = useStatic ? "static" : "scan";
+        if (!(useStatic ? ApplyStaticGlobals() : ApplyScannedGlobals()))
+        {
+            LOG("ResolveGlobals[%s]: a signature matched nothing (GObjects=%p GNames=%p GWorld=%p)",
+                label, g_GObjects, g_GNames, (void*)g_GWorld);
+            return false;
+        }
+
+        LOG("ResolveGlobals[%s]: GObjects=%p GNames=%p GWorld=%p",
+            label, g_GObjects, g_GNames, (void*)g_GWorld);
+
+        bool ok = false;
+        try { ok = ValidateSdk(); }   // /EHa: also traps access violations
+        catch (...) { ok = false; LOG("ResolveGlobals[%s]: exception during validation", label); }
+        return ok;
     }
 }
 
 bool UE::ResolveGlobals()
 {
-    using namespace Offsets;
-
-    if (USE_STATIC_OFFSETS)
+    // Static RVAs are exact but die on every game patch; the signatures are looser
+    // but usually survive one, so neither is dependable enough to be the only path.
+    // USE_STATIC_OFFSETS picks the order, not the winner.
+    for (int attempt = 0; attempt < 2; ++attempt)
     {
-        g_GObjects = G::moduleBase + GObjects_RVA;
-        g_GNames   = G::moduleBase + GNames_RVA;
-        g_GWorld   = reinterpret_cast<UObject**>(G::moduleBase + GWorld_RVA);
-    }
-    else
-    {
-        g_GObjects = Scanner::FindRipRel(SIG_GOBJECTS, 3, 7);
-        g_GNames   = Scanner::FindRipRel(SIG_GNAMES,   3, 7);
-        g_GWorld   = reinterpret_cast<UObject**>(Scanner::FindRipRel(SIG_GWORLD, 3, 7));
+        const bool useStatic = (attempt == 0) == Offsets::USE_STATIC_OFFSETS;
+        if (TryGlobalsSource(useStatic))
+        {
+            G::sdkReady = true;
+            LOG("ResolveGlobals: VALID (via %s)", useStatic ? "static offsets" : "signature scan");
+            return true;
+        }
     }
 
-    LOG("ResolveGlobals: GObjects=%p GNames=%p GWorld=%p", g_GObjects, g_GNames, (void*)g_GWorld);
-
-    bool ok = false;
-    try { ok = ValidateSdk(); }   // /EHa: also traps access violations
-    catch (...) { ok = false; LOG("ResolveGlobals: exception during validation"); }
-
-    G::sdkReady = ok;
-    LOG("ResolveGlobals: %s", ok ? "VALID" : "INVALID (signatures/offsets wrong for this build)");
-    return ok;
+    // Leave nothing half-resolved behind for a caller that ignores sdkReady.
+    g_GObjects = nullptr;
+    g_GNames   = nullptr;
+    g_GWorld   = nullptr;
+    G::sdkReady = false;
+    LOG("ResolveGlobals: INVALID -- both static offsets and signature scan failed; "
+        "run tools/find_globals.py against this game build");
+    return false;
 }
 
 UE::UObject* UE::GetWorld()

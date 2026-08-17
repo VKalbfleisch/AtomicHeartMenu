@@ -34,8 +34,10 @@
 namespace Offsets
 {
     // ---- Toggle: scan vs. static ------------------------------------------
-    // Static RVAs are instant and need no scan, but they are build-specific and
-    // break on every game patch; false uses the AOB patterns below instead.
+    // Which source ResolveGlobals TRIES FIRST -- not an either/or. Whichever is
+    // preferred, the other runs as a fallback if the first fails validation, so a
+    // game patch that moves the RVAs still comes up via the scan. Static is the
+    // sane default: instant, and exact for the build it was captured from.
     constexpr bool USE_STATIC_OFFSETS = true;
 
     // RVAs relative to module base 0x140000000. Captured from Steam buildid
