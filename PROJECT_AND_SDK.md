@@ -92,7 +92,10 @@ This is the raw output of **[Dumper-7](https://github.com/Encryqed/Dumper-7)**,
 captured by injecting it into the running game. It is the **source of truth** for
 every offset, class, and function in this exact build.
 
-Folder name encodes the engine/build: `4.27.2-18319896+++UE4+Release-4.27-AtomicHeart`.
+Folder name encodes the engine version and the game's changelist - the dump this
+repo was originally built against was `4.27.2-18319896+++UE4+Release-4.27-AtomicHeart`.
+The changelist moves with each game patch, so a dump of buildid `24534183` or later
+will not match that name.
 
 ### What's inside and when to use it
 
