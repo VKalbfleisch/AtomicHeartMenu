@@ -66,6 +66,7 @@ AtomicHeartMenu/
 │       └── offsets.h         *** ALL build-specific offsets live here ***
 │
 ├── tools/injector.cpp        Minimal LoadLibrary injector -> bin\injector.exe
+├── tools/find_globals.py     Recover GObjects/GNames/GWorld from the exe after a patch
 ├── deps/imgui, deps/minhook  Vendored dependencies
 │
 └── dumped-sdk/               *** The full Dumper-7 output for this build (see §3) ***
@@ -91,7 +92,10 @@ This is the raw output of **[Dumper-7](https://github.com/Encryqed/Dumper-7)**,
 captured by injecting it into the running game. It is the **source of truth** for
 every offset, class, and function in this exact build.
 
-Folder name encodes the engine/build: `4.27.2-18319896+++UE4+Release-4.27-AtomicHeart`.
+Folder name encodes the engine version and the game's changelist - the dump this
+repo was originally built against was `4.27.2-18319896+++UE4+Release-4.27-AtomicHeart`.
+The changelist moves with each game patch, so a dump of buildid `24534183` or later
+will not match that name.
 
 ### What's inside and when to use it
 
@@ -108,22 +112,30 @@ Runtime `GetFullName()` includes package paths such as
 paths in `src/sdk/offsets.h` function-name constants; omitting `/Script/` makes
 `FindFunction()` miss otherwise-valid functions.
 
-### The global offsets (from `Basic.hpp`)
+### The global offsets
 
-These are RVAs relative to image base `0x140000000`:
+These are RVAs relative to image base `0x140000000`, captured from Steam buildid
+`24534183`:
 
 | Global | RVA |
 |---|---|
-| `GObjects` (FUObjectArray) | `0x06EB7BD0` |
-| `GNames` (FNamePool) | `0x070ECBC0` |
-| `GWorld` (UWorld**) | `0x070E93C0` |
+| `GObjects` (TUObjectArray) | `0x06EC2BC0` |
+| `GNames` (FNamePool) | `0x070F7BC0` |
+| `GWorld` (UWorld**) | `0x070F43C0` |
 | `ProcessEvent` vtable index | `0x44` |
 
 They're already plugged into `src/sdk/offsets.h` (`USE_STATIC_OFFSETS = true`).
 
-> ⚠️ These are valid for **this build only**. After a game patch, re-inject Dumper-7
-> (it's built at `..\Dumper-7\out\build\vs2022\bin\Release\Dumper-7.dll`), re-read
-> `Basic.hpp`, and update `offsets.h`.
+> ⚠️ These are valid for **that build only** - every game patch moves them.
+
+Recovering them after a patch:
+
+1. `python tools/find_globals.py` - static analysis of the shipping exe, no game
+   running and no Dumper-7. Prints paste-ready constants for the three globals and
+   flags whichever entry in `offsets.h` has gone stale.
+2. Re-inject **Dumper-7** for anything beyond the globals - the class and function
+   member offsets in `Offsets::AH` need a real SDK dump, which this tool does not
+   attempt.
 
 ---
 

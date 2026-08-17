@@ -34,14 +34,15 @@
 namespace Offsets
 {
     // ---- Toggle: scan vs. static ------------------------------------------
-    // Using the addresses dumped by Dumper-7 for THIS build (UE4.27.2 Atomic
-    // Heart, 4.27.2-18319896). Reliable and instant; no AOB scan needed.
+    // Static RVAs are instant and need no scan, but they are build-specific and
+    // break on every game patch; false uses the AOB patterns below instead.
     constexpr bool USE_STATIC_OFFSETS = true;
 
-    // RVAs relative to module base 0x140000000 (from Dumper-7 Basic.hpp).
-    constexpr uintptr_t GObjects_RVA   = 0x06EB7BD0; // FUObjectArray
-    constexpr uintptr_t GNames_RVA     = 0x070ECBC0; // FNamePool
-    constexpr uintptr_t GWorld_RVA     = 0x070E93C0; // UWorld**
+    // RVAs relative to module base 0x140000000. Captured from Steam buildid
+    // 24534183; every game patch moves them. Regenerate with tools/find_globals.py.
+    constexpr uintptr_t GObjects_RVA   = 0x06EC2BC0; // TUObjectArray (not the outer FUObjectArray)
+    constexpr uintptr_t GNames_RVA     = 0x070F7BC0; // FNamePool
+    constexpr uintptr_t GWorld_RVA     = 0x070F43C0; // UWorld**
 
     // ---- AOB patterns (UE4.27 typical) ------------------------------------
     // GObjects: lea/ mov referencing the FUObjectArray (GUObjectArray).
@@ -51,8 +52,11 @@ namespace Offsets
     // GNames: FName::GetNames / NamePool reference.
     constexpr const char* SIG_GNAMES   = "48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? C6 05";
 
-    // GWorld: mov [rip+x], rax / mov rax, [rip+x] to the UWorld* global.
-    constexpr const char* SIG_GWORLD   = "48 8B 05 ?? ?? ?? ?? 48 3B C8 0F 84 ?? ?? ?? ?? 48 8B";
+    // GWorld: the standalone setter -- mov [rip+GWorld], rdx ; lea rax,[rip+x] ; ret.
+    // Unique image-wide on buildid 24534183. The previous read-side pattern matched
+    // nothing on this build, so the scan path handed back a null GWorld in silence;
+    // prefer a write site here, since GWorld has few writers and thousands of reads.
+    constexpr const char* SIG_GWORLD   = "48 89 15 ?? ?? ?? ?? 48 8D 05 ?? ?? ?? ?? C3";
 
     // ---- Engine member layout (UE4.27 defaults; verify with dump) ----------
     // UObject
