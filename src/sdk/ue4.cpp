@@ -636,7 +636,7 @@ bool UE::ResolveGlobals()
 {
     // Static RVAs are exact but die on every game patch; the signatures are looser
     // but usually survive one, so neither is dependable enough to be the only path.
-    // USE_STATIC_OFFSETS picks the order, not the winner.
+    // Order of preference only; see offsets.h -- USE_STATIC_OFFSETS.
     for (int attempt = 0; attempt < 2; ++attempt)
     {
         const bool useStatic = (attempt == 0) == Offsets::USE_STATIC_OFFSETS;

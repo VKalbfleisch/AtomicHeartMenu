@@ -23,21 +23,16 @@
 //  Dumper-7 (https://github.com/Encryqed/Dumper-7) once, which prints the
 //  GObjects / GNames / ProcessEvent addresses and a full C++ SDK.
 //
-//  Two ways to feed the engine globals to this menu:
-//    1. AOB scan at runtime (default; patterns below). Robust across patches.
-//    2. Hard-code the absolute addresses from a dump (set USE_STATIC_OFFSETS).
-//
-//  The AOB patterns below are the common UE4.27 ones. If a scan fails, the menu
-//  will say "SDK: not resolved" and you fix the pattern/offset here.
+//  Both sources are tried: the static RVAs below and the SIG_* scan, in the
+//  order USE_STATIC_OFFSETS picks. If neither validates the menu shows
+//  "SDK NOT resolved"; tools/find_globals.py recovers the RVAs from the exe.
 // ===========================================================================
 
 namespace Offsets
 {
     // ---- Toggle: scan vs. static ------------------------------------------
-    // Which source ResolveGlobals TRIES FIRST -- not an either/or. Whichever is
-    // preferred, the other runs as a fallback if the first fails validation, so a
-    // game patch that moves the RVAs still comes up via the scan. Static is the
-    // sane default: instant, and exact for the build it was captured from.
+    // Which source ResolveGlobals tries first. Both run: the other is the
+    // fallback if the first fails validation.
     constexpr bool USE_STATIC_OFFSETS = true;
 
     // RVAs relative to module base 0x140000000. Captured from Steam buildid

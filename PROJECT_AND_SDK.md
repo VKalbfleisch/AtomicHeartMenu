@@ -62,7 +62,7 @@ AtomicHeartMenu/
 │   ├── features/features.{h,cpp}  Per-frame cheat logic (god mode, fly, one-hit, …)
 │   └── sdk/                  *Minimal* hand-written UE4 runtime SDK (see §4)
 │       ├── ue4.{h,cpp}       FName/UObject/GObjects/GWorld + ProcessEvent + lookups
-│       ├── scanner.{h,cpp}   AOB scanner (fallback; unused now that offsets are static)
+│       ├── scanner.{h,cpp}   AOB scanner - the fallback when the static RVAs fail
 │       └── offsets.h         *** ALL build-specific offsets live here ***
 │
 ├── tools/injector.cpp        Minimal LoadLibrary injector -> bin\injector.exe
