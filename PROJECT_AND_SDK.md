@@ -62,7 +62,7 @@ AtomicHeartMenu/
 │   ├── features/features.{h,cpp}  Per-frame cheat logic (god mode, fly, one-hit, …)
 │   └── sdk/                  *Minimal* hand-written UE4 runtime SDK (see §4)
 │       ├── ue4.{h,cpp}       FName/UObject/GObjects/GWorld + ProcessEvent + lookups
-│       ├── scanner.{h,cpp}   AOB scanner (fallback; unused now that offsets are static)
+│       ├── scanner.{h,cpp}   AOB scanner - the fallback when the static RVAs fail
 │       └── offsets.h         *** ALL build-specific offsets live here ***
 │
 ├── tools/injector.cpp        Minimal LoadLibrary injector -> bin\injector.exe
@@ -124,18 +124,27 @@ These are RVAs relative to image base `0x140000000`, captured from Steam buildid
 | `GWorld` (UWorld**) | `0x070F43C0` |
 | `ProcessEvent` vtable index | `0x44` |
 
-They're already plugged into `src/sdk/offsets.h` (`USE_STATIC_OFFSETS = true`).
+They're already plugged into `src/sdk/offsets.h`.
 
 > ⚠️ These are valid for **that build only** - every game patch moves them.
 
-Recovering them after a patch:
+Resolution does not depend on them alone. `ResolveGlobals()` tries the static RVAs
+and the `SIG_*` signature scan, in the order `USE_STATIC_OFFSETS` picks, and keeps
+whichever passes validation. A patch that moves the RVAs but leaves the signatures
+matching therefore still comes up on its own. Recovering the numbers by hand:
 
 1. `python tools/find_globals.py` - static analysis of the shipping exe, no game
-   running and no Dumper-7. Prints paste-ready constants for the three globals and
-   flags whichever entry in `offsets.h` has gone stale.
+   running and no Dumper-7. Prints paste-ready constants for the three globals plus
+   `ExpectedImageSize`, and flags whichever entry in `offsets.h` has gone stale.
 2. Re-inject **Dumper-7** for anything beyond the globals - the class and function
    member offsets in `Offsets::AH` need a real SDK dump, which this tool does not
    attempt.
+
+Validation is not just a null check: the object sweep confirms `GObjects` and
+`GNames` by resolving core UE4 type names, and `ValidateGWorld()` walks `*GWorld`
+to confirm it lands on a `World` class. A null `*GWorld` does not fail resolution -
+it is legitimately null until a map loads - so it is logged as unverified, and the
+check only proves the pointer out once a map is in.
 
 ---
 

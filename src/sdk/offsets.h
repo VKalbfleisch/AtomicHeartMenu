@@ -23,19 +23,16 @@
 //  Dumper-7 (https://github.com/Encryqed/Dumper-7) once, which prints the
 //  GObjects / GNames / ProcessEvent addresses and a full C++ SDK.
 //
-//  Two ways to feed the engine globals to this menu:
-//    1. AOB scan at runtime (default; patterns below). Robust across patches.
-//    2. Hard-code the absolute addresses from a dump (set USE_STATIC_OFFSETS).
-//
-//  The AOB patterns below are the common UE4.27 ones. If a scan fails, the menu
-//  will say "SDK: not resolved" and you fix the pattern/offset here.
+//  Both sources are tried: the static RVAs below and the SIG_* scan, in the
+//  order USE_STATIC_OFFSETS picks. If neither validates the menu shows
+//  "SDK NOT resolved"; tools/find_globals.py recovers the RVAs from the exe.
 // ===========================================================================
 
 namespace Offsets
 {
     // ---- Toggle: scan vs. static ------------------------------------------
-    // Static RVAs are instant and need no scan, but they are build-specific and
-    // break on every game patch; false uses the AOB patterns below instead.
+    // Which source ResolveGlobals tries first. Both run: the other is the
+    // fallback if the first fails validation.
     constexpr bool USE_STATIC_OFFSETS = true;
 
     // RVAs relative to module base 0x140000000. Captured from Steam buildid
@@ -43,6 +40,10 @@ namespace Offsets
     constexpr uintptr_t GObjects_RVA   = 0x06EC2BC0; // TUObjectArray (not the outer FUObjectArray)
     constexpr uintptr_t GNames_RVA     = 0x070F7BC0; // FNamePool
     constexpr uintptr_t GWorld_RVA     = 0x070F43C0; // UWorld**
+
+    // PE SizeOfImage (checked against G::moduleSize at injection) of the build the
+    // RVAs above came from, so a patched game is named as such. 0 disables it.
+    constexpr size_t ExpectedImageSize = 0x78F0000;
 
     // ---- AOB patterns (UE4.27 typical) ------------------------------------
     // GObjects: lea/ mov referencing the FUObjectArray (GUObjectArray).

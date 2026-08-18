@@ -168,6 +168,11 @@ def read_current_offsets(repo_root):
         m = re.search(rf"{label}_RVA\s*=\s*(0x[0-9A-Fa-f]+)", text)
         if m:
             found[label] = int(m.group(1), 16)
+    # 0 is the documented "disabled" value, so decimal has to parse too.
+    m = re.search(r"ExpectedImageSize\s*=\s*(0x[0-9A-Fa-f]+|[0-9]+)", text)
+    if m:
+        raw = m.group(1)
+        found["ExpectedImageSize"] = int(raw, 16 if raw.lower().startswith("0x") else 10)
     return found
 
 
@@ -197,10 +202,22 @@ def main():
 
     print(f"exe          {exe}")
     image = Image(exe)
-    print(f"SizeOfImage  0x{image.size_of_image:X}\n")
 
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     current = read_current_offsets(repo_root)
+
+    # Not counted as a problem: after a patch the image size always differs, and
+    # that is the case the tool exists for.
+    was_size = current.get("ExpectedImageSize")
+    if was_size is None:
+        size_state = "  (offsets.h has no ExpectedImageSize)"
+    elif was_size == 0:
+        size_state = "  (offsets.h has 0 -- check disabled)"
+    elif was_size == image.size_of_image:
+        size_state = "  (offsets.h already up to date)"
+    else:
+        size_state = f"  (offsets.h has 0x{was_size:X} -- different build)"
+    print(f"SizeOfImage  0x{image.size_of_image:X}{size_state}\n")
 
     results = {}
     problems = 0
@@ -234,6 +251,7 @@ def main():
               "// TUObjectArray (not the outer FUObjectArray)")
         print(f"    constexpr uintptr_t GNames_RVA     = 0x{results['GNames']:08X}; // FNamePool")
         print(f"    constexpr uintptr_t GWorld_RVA     = 0x{results['GWorld']:08X}; // UWorld**")
+        print(f"    constexpr size_t ExpectedImageSize = 0x{image.size_of_image:X};")
         print("\nThen rebuild, inject, and confirm the log says "
               "\"ResolveGlobals: VALID\".")
 

@@ -94,14 +94,14 @@ timelines are loose. Contributions are welcome, see
 
 ---
 
-## Detected on your machine
+## Target
 
 | | |
 |---|---|
 | Process | `AtomicHeart-Win64-Shipping.exe` (the launcher `AtomicHeart.exe` is separate) |
 | Architecture | x64, base `0x140000000` |
-| Render backend | **DirectX 12** (confirmed: `D3D12Core.dll` + `d3d11on12.dll` + DLSS loaded) |
-| Toolchain present | VS 2022 Community, CMake, Git |
+| Render backend | **DirectX 12** (`D3D12Core.dll` + `d3d11on12.dll` + DLSS) |
+| Build toolchain | Visual Studio 2022 (Community or Build Tools) with the C++ workload |
 
 That's why the render hook targets DX12, not DX11.
 
@@ -151,7 +151,9 @@ and `PROJECT_AND_SDK.md` in the same pass so feature notes do not go stale.
 
 ## Build
 
-Easiest - double-click **`build.bat`** (or):
+Easiest - double-click **`build.bat`**. It uses CMake from `PATH` if there is one,
+otherwise the copy bundled with your Visual Studio 2022 install (Build Tools ships
+CMake but puts nothing on `PATH`). Equivalent by hand:
 
 ```bat
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
@@ -289,7 +291,10 @@ Runtime function names include `/Script/...`; keep the function constants in
 ### After a game patch
 
 The engine globals (`GObjects` / `GNames` / `GWorld`) are the first thing a patch
-breaks, and everything else is gated on them. To recover them:
+breaks, and everything else is gated on them. `ResolveGlobals()` tries both the
+hard-coded RVAs and the `SIG_*` signature scan and keeps whichever validates, so a
+patch that moves the addresses but leaves the signatures intact recovers by itself.
+When it doesn't:
 
 ```bat
 python tools\find_globals.py
@@ -299,14 +304,18 @@ That reads the shipping exe off disk - no game running, no Dumper-7 - and prints
 paste-ready constants for `offsets.h`, flagging which current values have gone
 stale. Rebuild, inject, and confirm the log says `ResolveGlobals: VALID`.
 
+The log names this case directly: injection compares the game's image size against
+the build `offsets.h` was captured from and warns when they differ.
+
 ### Resolving the offsets - the path to *full* control
 1. Inject **[Dumper-7](https://github.com/Encryqed/Dumper-7)** into the game once.
    It prints the `GObjects`, `GNames`, and `ProcessEvent` addresses **and** dumps a
    full C++ SDK of every Atomic Heart class/function. (For the three globals alone,
    `tools\find_globals.py` above is quicker and needs nothing installed.)
 2. Plug the globals into `offsets.h`:
-   - Either fix the `SIG_*` AOB patterns, **or**
-   - set `USE_STATIC_OFFSETS = true` and paste the RVAs (`addr - 0x140000000`).
+   - Paste the RVAs (`addr - 0x140000000`), **and/or**
+   - fix the `SIG_*` AOB patterns. `USE_STATIC_OFFSETS` picks which is tried first;
+     both are tried either way.
 3. For each game-specific cheat, open the dumped SDK, find the class
    (e.g. the weapon / health component), copy its property offset or
    `BlueprintCallable` `UFunction`, and read/write or `ProcessEvent` it in
@@ -323,8 +332,8 @@ you can trigger from here once the SDK resolves.
   fine for actor functions; if a particular function must run on the game thread,
   hook the game's tick instead (`AActor::Tick` / `UWorld::Tick` from the dump).
 - `VFUNC_PROCESSEVENT` (vtable index) and the `SIG_*`/member offsets in `offsets.h`
-  are the first things to re-check after a game patch. For the three engine globals,
-  `tools\find_globals.py` recovers them - see "After a game patch" above.
+  are the first things to re-check after a game patch. The three engine globals are
+  handled for you where possible - see "After a game patch" above.
 - To ship without the debug console, change `Log::Init(true)` to `false` in
   `dllmain.cpp`.
 ```
