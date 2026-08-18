@@ -544,34 +544,39 @@ void UE::UObject::ProcessEvent(UObject* function, void* params)
 // ---------------------------------------------------------------------------
 namespace
 {
+    // Three outcomes, not two. A null *GWorld disproves nothing -- the pointer is
+    // legitimately null until a map loads -- but it proves nothing either, and a
+    // wrong address landing on zeroed .data reads exactly the same. Calling that
+    // "valid" let a source that cannot prove itself beat one that can.
+    enum class Verdict { Ok, Unverified, Bad };
+
     // The object sweep below covers GObjects and GNames but never touches GWorld,
-    // so it gets its own check. Null is tolerated, not failed: the pointer really
-    // is null until a map loads. A wrong address reading as zero still slips past.
-    bool ValidateGWorld()
+    // so it gets its own check.
+    Verdict ValidateGWorld()
     {
         if (!Mem::IsReadable(g_GWorld, sizeof(UE::UObject*)))
         {
             LOG("ValidateGWorld: %p unreadable -- wrong address for this build", (void*)g_GWorld);
-            return false;
+            return Verdict::Bad;
         }
 
         UE::UObject* world = *g_GWorld;
         if (!world)
         {
-            LOG("ValidateGWorld: null (no map loaded yet) -- unverified");
-            return true;
+            LOG("ValidateGWorld: null (no map loaded, or the address is wrong) -- unverified");
+            return Verdict::Unverified;
         }
         if (!Mem::IsReadable(world, 0x30))
         {
             LOG("ValidateGWorld: *GWorld=%p unreadable -- not a UObject", (void*)world);
-            return false;
+            return Verdict::Bad;
         }
 
         UE::UObject* cls = world->Class();
         if (!Mem::IsReadable(cls, 0x30))
         {
             LOG("ValidateGWorld: *GWorld=%p has unreadable class %p", (void*)world, (void*)cls);
-            return false;
+            return Verdict::Bad;
         }
 
         std::string name = cls->GetName();
@@ -579,24 +584,24 @@ namespace
         {
             LOG("ValidateGWorld: *GWorld=%p class name would not resolve -- cannot verify",
                 (void*)world);
-            return false;
+            return Verdict::Bad;
         }
 
         bool ok = (name == "World");
         LOG("ValidateGWorld: *GWorld=%p class=%s -> %s", (void*)world, name.c_str(),
             ok ? "ok" : "NOT a UWorld");
-        return ok;
+        return ok ? Verdict::Ok : Verdict::Bad;
     }
 
     // Confirm GObjects+GNames really point at the engine by checking that the
     // first batch of objects resolve to the well-known core UE4 type names.
     // Garbage addresses will essentially never produce these strings.
-    bool ValidateSdk()
+    Verdict ValidateSdk()
     {
-        if (!g_GObjects || !g_GNames || !g_GWorld) return false;
+        if (!g_GObjects || !g_GNames || !g_GWorld) return Verdict::Bad;
 
         int n = UE::NumObjects();
-        if (n < 64 || n > 20'000'000) { LOG("ValidateSdk: NumObjects=%d out of range", n); return false; }
+        if (n < 64 || n > 20'000'000) { LOG("ValidateSdk: NumObjects=%d out of range", n); return Verdict::Bad; }
 
         int checked = 0, coreHits = 0;
         for (int i = 0; i < 512 && i < n; ++i)
@@ -612,10 +617,11 @@ namespace
                 ++coreHits;
         }
         LOG("ValidateSdk: checked=%d coreHits=%d", checked, coreHits);
+        if (checked <= 32 || coreHits < 3) return Verdict::Bad;
         // Order matters: GWorld's verdict rests on GetName(), which reads GNames.
         // Run it only once the sweep has shown GNames resolves real names, or a
         // broken GNames reports itself as a bad GWorld.
-        return checked > 32 && coreHits >= 3 && ValidateGWorld();
+        return ValidateGWorld();
     }
 
     bool ApplyStaticGlobals()
@@ -634,23 +640,23 @@ namespace
         return g_GObjects && g_GNames && g_GWorld;
     }
 
-    bool TryGlobalsSource(bool useStatic)
+    Verdict TryGlobalsSource(bool useStatic)
     {
         const char* label = useStatic ? "static" : "scan";
         if (!(useStatic ? ApplyStaticGlobals() : ApplyScannedGlobals()))
         {
             LOG("ResolveGlobals[%s]: a signature matched nothing (GObjects=%p GNames=%p GWorld=%p)",
                 label, g_GObjects, g_GNames, (void*)g_GWorld);
-            return false;
+            return Verdict::Bad;
         }
 
         LOG("ResolveGlobals[%s]: GObjects=%p GNames=%p GWorld=%p",
             label, g_GObjects, g_GNames, (void*)g_GWorld);
 
-        bool ok = false;
-        try { ok = ValidateSdk(); }   // /EHa: also traps access violations
-        catch (...) { ok = false; LOG("ResolveGlobals[%s]: exception during validation", label); }
-        return ok;
+        Verdict verdict = Verdict::Bad;
+        try { verdict = ValidateSdk(); }   // /EHa: also traps access violations
+        catch (...) { LOG("ResolveGlobals[%s]: exception during validation", label); }
+        return verdict;
     }
 }
 
@@ -659,15 +665,46 @@ bool UE::ResolveGlobals()
     // Static RVAs are exact but die on every game patch; the signatures are looser
     // but usually survive one, so neither is dependable enough to be the only path.
     // Order of preference only; see offsets.h -- USE_STATIC_OFFSETS.
+    uint8_t*  unverifiedObjects = nullptr;
+    uint8_t*  unverifiedNames   = nullptr;
+    UObject** unverifiedWorld   = nullptr;
+    const char* unverifiedLabel = nullptr;
+
     for (int attempt = 0; attempt < 2; ++attempt)
     {
         const bool useStatic = (attempt == 0) == Offsets::USE_STATIC_OFFSETS;
-        if (TryGlobalsSource(useStatic))
+        const char* label = useStatic ? "static offsets" : "signature scan";
+
+        Verdict verdict = TryGlobalsSource(useStatic);
+        if (verdict == Verdict::Ok)
         {
             G::sdkReady = true;
-            LOG("ResolveGlobals: VALID (via %s)", useStatic ? "static offsets" : "signature scan");
+            LOG("ResolveGlobals: VALID (via %s)", label);
             return true;
         }
+
+        // Hold an unverified source, but let the other one prove a GWorld outright
+        // if it can. The next attempt overwrites the three globals, so they are kept
+        // here rather than re-derived: re-running the scan would cost another 40ms.
+        if (verdict == Verdict::Unverified && !unverifiedLabel)
+        {
+            unverifiedObjects = g_GObjects;
+            unverifiedNames   = g_GNames;
+            unverifiedWorld   = g_GWorld;
+            unverifiedLabel   = label;
+        }
+    }
+
+    if (unverifiedLabel)
+    {
+        g_GObjects = unverifiedObjects;
+        g_GNames   = unverifiedNames;
+        g_GWorld   = unverifiedWorld;
+        G::sdkReady = true;
+        LOG("ResolveGlobals: VALID (via %s) -- GWorld read null and no source could confirm "
+            "one, so it stays unverified; world features fail quietly if it is wrong.",
+            unverifiedLabel);
+        return true;
     }
 
     // Leave nothing half-resolved behind for a caller that ignores sdkReady.
