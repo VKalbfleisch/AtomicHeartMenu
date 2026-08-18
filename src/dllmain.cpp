@@ -57,9 +57,7 @@ namespace
         LOG("Game module base=%p size=0x%zX", (void*)G::moduleBase, G::moduleSize);
 
         if (Offsets::ExpectedImageSize && G::moduleSize != Offsets::ExpectedImageSize)
-            LOG("WARNING: game image is 0x%zX, offsets.h was captured from 0x%zX -- the game "
-                "has been patched. The static RVAs are stale; resolution will fall back to the "
-                "signature scan. If that also fails, run tools/find_globals.py on this build.",
+            LOG("Game image 0x%zX; offsets.h was captured from 0x%zX (different game build).",
                 G::moduleSize, Offsets::ExpectedImageSize);
 
         if (!DX12Hook::Install())
@@ -108,8 +106,8 @@ namespace
                 if (!sdkPrewarmed && !sdkWarningLogged && nowMs - firstSdkAttemptMs > 10000)
                 {
                     LOG_SDK("WARNING: not resolved yet - run tools/find_globals.py against this "
-                            "game build and update offsets.h. Retrying every %llums from here.",
-                            sdkRetryDelayMs);
+                            "game build and update offsets.h. Backing off toward a retry every "
+                            "%llums.", kSdkRetryDelayCapMs);
                     sdkWarningLogged = true;
                 }
             }

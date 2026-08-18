@@ -142,8 +142,9 @@ matching therefore still comes up on its own. Recovering the numbers by hand:
 
 Validation is not just a null check: the object sweep confirms `GObjects` and
 `GNames` by resolving core UE4 type names, and `ValidateGWorld()` walks `*GWorld`
-to confirm it lands on a `World` class. A null `*GWorld` is reported as unverified
-rather than valid - it is legitimately null until a map loads.
+to confirm it lands on a `World` class. A null `*GWorld` does not fail resolution -
+it is legitimately null until a map loads - so it is logged as unverified, and the
+check only proves the pointer out once a map is in.
 
 ---
 

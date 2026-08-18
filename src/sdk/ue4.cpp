@@ -549,7 +549,11 @@ namespace
     // is null until a map loads. A wrong address reading as zero still slips past.
     bool ValidateGWorld()
     {
-        if (!Mem::IsReadable(g_GWorld, sizeof(UE::UObject*))) return false;
+        if (!Mem::IsReadable(g_GWorld, sizeof(UE::UObject*)))
+        {
+            LOG("ValidateGWorld: %p unreadable -- wrong address for this build", (void*)g_GWorld);
+            return false;
+        }
 
         UE::UObject* world = *g_GWorld;
         if (!world)
@@ -557,12 +561,27 @@ namespace
             LOG("ValidateGWorld: null (no map loaded yet) -- unverified");
             return true;
         }
-        if (!Mem::IsReadable(world, 0x30)) return false;
+        if (!Mem::IsReadable(world, 0x30))
+        {
+            LOG("ValidateGWorld: *GWorld=%p unreadable -- not a UObject", (void*)world);
+            return false;
+        }
 
         UE::UObject* cls = world->Class();
-        if (!Mem::IsReadable(cls, 0x30)) return false;
+        if (!Mem::IsReadable(cls, 0x30))
+        {
+            LOG("ValidateGWorld: *GWorld=%p has unreadable class %p", (void*)world, (void*)cls);
+            return false;
+        }
 
         std::string name = cls->GetName();
+        if (name.empty())
+        {
+            LOG("ValidateGWorld: *GWorld=%p class name would not resolve -- cannot verify",
+                (void*)world);
+            return false;
+        }
+
         bool ok = (name == "World");
         LOG("ValidateGWorld: *GWorld=%p class=%s -> %s", (void*)world, name.c_str(),
             ok ? "ok" : "NOT a UWorld");
@@ -593,6 +612,9 @@ namespace
                 ++coreHits;
         }
         LOG("ValidateSdk: checked=%d coreHits=%d", checked, coreHits);
+        // Order matters: GWorld's verdict rests on GetName(), which reads GNames.
+        // Run it only once the sweep has shown GNames resolves real names, or a
+        // broken GNames reports itself as a bad GWorld.
         return checked > 32 && coreHits >= 3 && ValidateGWorld();
     }
 
@@ -653,8 +675,15 @@ bool UE::ResolveGlobals()
     g_GNames   = nullptr;
     g_GWorld   = nullptr;
     G::sdkReady = false;
-    LOG("ResolveGlobals: INVALID -- both static offsets and signature scan failed; "
-        "run tools/find_globals.py against this game build");
+    if (Offsets::ExpectedImageSize && G::moduleSize != Offsets::ExpectedImageSize)
+        LOG("ResolveGlobals: INVALID -- both static offsets and signature scan failed. The game "
+            "image (0x%zX) differs from the build offsets.h was captured from (0x%zX): the game "
+            "has been patched. Run tools/find_globals.py against this build.",
+            G::moduleSize, Offsets::ExpectedImageSize);
+    else
+        LOG("ResolveGlobals: INVALID -- both static offsets and signature scan failed on the "
+            "build offsets.h was captured from, so this is not a game patch: the RVAs and SIG_* "
+            "patterns are wrong for it, or the exe has been modified.");
     return false;
 }
 
