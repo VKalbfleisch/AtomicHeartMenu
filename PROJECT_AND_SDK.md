@@ -316,13 +316,26 @@ violations. Layered defenses:
   on the call, and that fault happens after control has left our code, where
   `/EHa` and `catch(...)` can no longer contain it. `UObject::ProcessEvent`
   returns instead of dispatching when its vtable slot fails this check.
-- `UE::IsLiveObject()` gates every **cached** game pointer. Destroying a `UObject`
+- `UE::IsLiveObject()` gates **cached** game pointers. Destroying a `UObject`
   does not unmap its memory - the allocator hands the block straight back out - so
   a dead object stays readable and its fields return whatever now occupies those
   bytes. Liveness is asked of the engine's own registry instead: a live object is
   reachable at its own `InternalIndex` in `GObjects`, and destruction clears that
   slot. `IsLiveObjectNamed()` adds a full-name confirmation for caches keyed by
-  name, since a recycled slot can hold a different live object.
+  name, since a recycled slot can hold a different live object. It proves "still
+  registered", not "safe to dispatch on": an object marked `PendingKill` by GC
+  still round-trips until its destructor runs. The object caches, the fly path and
+  the subsystem pins use it; the older AI caches still gate on `Mem::IsReadable`
+  and have not been converted.
+- `Scanner::IsFunctionEntry()` gates the **hardcoded native-hook RVAs** in
+  `features.cpp`. `IsExecutableAddress` is true of every byte in `.text`, including
+  mid-instruction, so it cannot catch an RVA that a patch has shifted; MinHook would
+  then write its 5-byte JMP across an instruction boundary and rewrite the game's
+  own code. Resolving the address against the image's exception directory makes a
+  stale RVA fail closed - and beginning at an entry is not enough on its own, since
+  a linker-split function has one per range, so an entry that chains to another is
+  refused too. Injection reports any RVA that has gone stale. The signature-derived
+  hooks in `src/hooks/` do not use it yet.
 - `ValidateSdk()` requires real core UE4 names (`Object`, `Class`, `Property`…)
   before flipping `sdkReady` - wrong offsets degrade to "SDK: NOT resolved".
 - `GetFullName()` caps the `Outer` chain depth (no runaway strings).

@@ -348,13 +348,23 @@ you can trigger from here once the SDK resolves.
 ---
 
 ## Notes & caveats
-- Cheats are applied from the **render thread** (inside the Present hook). This is
-  fine for actor functions; if a particular function must run on the game thread,
-  hook the game's tick instead (`AActor::Tick` / `UWorld::Tick` from the dump).
-- `VFUNC_PROCESSEVENT` (vtable index) and the `SIG_*`/member offsets in `offsets.h`
-  are the first things to re-check after a game patch. The three engine globals are
-  handled for you where possible, and **Debug → Verify member offsets** checks the
-  member layer against the running game - see "After a game patch" above.
+- Cheats are applied from the **render thread** (inside the Present hook). That is
+  fine for property reads and writes, and **not** fine for anything that mutates the
+  actor graph - `K2_SetActorLocation` is a full component move, not a property
+  write. Symptoms are subtle rather than loud: the camera desynchronising from the
+  character mesh for a frame, or a call like `SetMovementMode` returning having done
+  nothing. Marshal that work to the game thread with `QueueGameThread`, which drains
+  inside the `ProcessEvent` hook, the way fly, the teleports and the AI features do.
+  See CONTRIBUTING.md for the full rule.
+- Native hooks must target a **function entry**, checked with
+  `Scanner::IsFunctionEntry` - a hardcoded RVA that a patch has shifted otherwise
+  gets a MinHook jump written mid-instruction, rewriting the game's code. Injection
+  self-checks the hardcoded RVAs and logs any that have gone stale.
+- `VFUNC_PROCESSEVENT` (vtable index), the `SIG_*`/member offsets in `offsets.h`, and
+  any hardcoded native-hook RVA are the first things to re-check after a game patch.
+  The three engine globals are handled for you where possible, and **Debug → Verify
+  member offsets** checks the member layer against the running game - see "After a
+  game patch" above.
 - To ship without the debug console, change `Log::Init(true)` to `false` in
   `dllmain.cpp`.
 ```
