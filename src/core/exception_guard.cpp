@@ -14,6 +14,7 @@
 #include "exception_guard.h"
 #include "globals.h"
 #include "log.h"
+#include "memory.h"
 #include <Windows.h>
 #include <Psapi.h>
 #include <atomic>
@@ -233,6 +234,111 @@ namespace
                     static_cast<unsigned long long>(accessKind),
                     p->ExceptionRecord->ExceptionFlags);
                 logged = true;
+#if defined(_M_X64)
+                // An EXECUTE violation (access==8) whose faulting address IS the
+                // instruction pointer is a call through a bad function pointer.
+                // Neither ip nor fault names the caller, and neither works as an
+                // anchor, because neither is real code.
+                if (accessKind == 8 && faultAddr == ip && p->ContextRecord)
+                {
+                    PCONTEXT c = p->ContextRecord;
+
+                    // Unmapped and mapped-but-not-executable are different bugs:
+                    // the first is a wild value, the second a real pointer to the
+                    // wrong kind of memory.
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    if (VirtualQuery(reinterpret_cast<void*>(ip), &mbi, sizeof(mbi)))
+                        // BaseAddress, not AllocationBase: RegionSize is measured
+                        // from the former, so only that pair describes a range.
+                        LOG("ExceptionGuard:   target state=0x%lX protect=0x%lX type=0x%lX "
+                            "regionBase=0x%llX regionSize=0x%llX allocBase=0x%llX",
+                            mbi.State, mbi.Protect, mbi.Type,
+                            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mbi.BaseAddress)),
+                            static_cast<unsigned long long>(mbi.RegionSize),
+                            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mbi.AllocationBase)));
+                    else
+                        LOG("ExceptionGuard:   target is not mapped at all (VirtualQuery failed)");
+
+                    // A register holding the target names the indirect-call form;
+                    // one holding a near-miss names the vtable or jump table the
+                    // target was loaded from.
+                    struct Reg { const char* name; DWORD64 value; };
+                    const Reg regs[] = {
+                        { "rax", c->Rax }, { "rcx", c->Rcx }, { "rdx", c->Rdx }, { "rbx", c->Rbx },
+                        { "rsp", c->Rsp }, { "rbp", c->Rbp }, { "rsi", c->Rsi }, { "rdi", c->Rdi },
+                        { "r8",  c->R8  }, { "r9",  c->R9  }, { "r10", c->R10 }, { "r11", c->R11 },
+                        { "r12", c->R12 }, { "r13", c->R13 }, { "r14", c->R14 }, { "r15", c->R15 },
+                    };
+                    for (const Reg& r : regs)
+                    {
+                        char desc[512]{};
+                        DescribeAddress(static_cast<uintptr_t>(r.value), desc, sizeof(desc));
+                        long long delta = static_cast<long long>(r.value) - static_cast<long long>(ip);
+                        char note[96]{};
+                        if (r.value == ip)
+                            sprintf_s(note, sizeof(note), "   <-- EQUALS the bad target");
+                        else if (delta > -0x10000 && delta < 0x10000)
+                            sprintf_s(note, sizeof(note), "   <-- target%+lld", delta);
+                        LOG("ExceptionGuard:   %-3s = 0x%016llX  %s%s",
+                            r.name, static_cast<unsigned long long>(r.value), desc, note);
+                    }
+
+                    // RtlVirtualUnwind is what the OS unwinder uses, so .pdata gives
+                    // the real frame chain rather than the guess the scan below
+                    // makes. The faulting frame has no unwind entry -- its address is
+                    // not even mapped -- which is the leaf case: return at [rsp].
+                    try
+                    {
+                        CONTEXT walk = *c;
+                        for (int frame = 0; frame < 16; ++frame)
+                        {
+                            char fdesc[512]{};
+                            DescribeAddress(static_cast<uintptr_t>(walk.Rip), fdesc, sizeof(fdesc));
+                            LOG("ExceptionGuard:   unwind frame %-2d rip=%s%s", frame, fdesc,
+                                AddressInSelf(static_cast<uintptr_t>(walk.Rip))
+                                    ? "   <-- INSIDE AtomicHeartMenu.dll" : "");
+
+                            DWORD64 imageBase = 0;
+                            PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(walk.Rip, &imageBase, nullptr);
+                            if (!rf)
+                            {
+                                if (!Mem::IsReadable(reinterpret_cast<void*>(walk.Rsp), sizeof(DWORD64)))
+                                    break;
+                                walk.Rip  = *reinterpret_cast<DWORD64*>(walk.Rsp);
+                                walk.Rsp += sizeof(DWORD64);
+                            }
+                            else
+                            {
+                                PVOID   handlerData      = nullptr;
+                                DWORD64 establisherFrame = 0;
+                                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, walk.Rip, rf,
+                                                 &walk, &handlerData, &establisherFrame, nullptr);
+                            }
+                            if (!walk.Rip)
+                                break;
+                        }
+                    }
+                    catch (...) { LOG("ExceptionGuard:   unwind walk faulted (ignored)"); }
+
+                    // A `call` leaves its return address at [rsp] on entry to the
+                    // (never-executed) target; a tail `jmp` pushes nothing and
+                    // leaves the grandparent's there, hence 24 slots rather than 1.
+                    auto* sp = reinterpret_cast<uintptr_t*>(c->Rsp);
+                    for (int i = 0; i < 24; ++i)
+                    {
+                        if (!Mem::IsReadable(sp + i, sizeof(uintptr_t)))
+                            break;
+                        uintptr_t ret = sp[i];
+                        if (!Mem::IsExecutable(reinterpret_cast<void*>(ret), 1))
+                            continue;
+                        char retDesc[512]{};
+                        DescribeAddress(ret, retDesc, sizeof(retDesc));
+                        LOG("ExceptionGuard:   execute-fault caller candidate [rsp+0x%X] = %s%s",
+                            i * 8, retDesc,
+                            AddressInSelf(ret) ? "   <-- INSIDE AtomicHeartMenu.dll" : "");
+                    }
+                }
+#endif
             }
         }
 
