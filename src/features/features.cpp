@@ -1341,6 +1341,10 @@ namespace
     // streaming hard enough to destroy a world subsystem mid-session. The class
     // pin catches what IsLiveObject alone does not: a live object of a different
     // class occupying the recycled slot.
+    //
+    // Not synchronised: each instance is reached from ONE thread -- the world
+    // streaming pin from the game thread, since every RefreshFlyStreaming caller is
+    // there, and the debug pin from the render thread.
     struct PinnedSubsystem
     {
         const char* label;
@@ -8798,11 +8802,151 @@ namespace
         FVector next = Add(currentLoc, Scale(input, flySpeed * dt));
         if (SetActorLocation(pawn, next, false))
         {
-            g_lastLoc = next;
+            // Deliberately not writing g_lastLoc: the render tick rewrites it from
+            // the pawn every frame while fly is on and the coordinate HUD reads it
+            // there, so writing here only puts a non-atomic FVector across threads.
             RefreshFlyStreaming(pawn, false);
             return true;
         }
         return false;
+    }
+
+    // Fly runs from the DX12 Present hook = the RENDER thread, but the work it
+    // does is not render-thread-safe.
+    //
+    // K2_SetActorLocation is not a property write. It is a full component move:
+    // scene-component transform, physics body, overlap refresh that can fire
+    // BeginOverlap delegates into arbitrary blueprint code, and streaming /
+    // significance updates. Run from Present it races the game thread's own tick
+    // over the same actor graph, and the corruption surfaced on a game worker
+    // thread deep inside AI code with no frame of ours on the stack.
+    std::atomic<bool>      g_flyStepPending{ false };
+    std::atomic<float>     g_flyPendingDt{ 0.0f };  // held-input seconds not yet applied
+    std::atomic<ULONGLONG> g_flyStepQueuedMs{ 0 };
+
+    // Only the queued task clears g_flyStepPending, so a pump that stops draining
+    // would otherwise wedge fly for the rest of the session and say nothing.
+    constexpr ULONGLONG kFlyStepStuckMs = 1000;
+
+    void EnterFlyingMovementMode(UObject* pawn, uint8_t* mv); // defined below
+
+    // True while any fly movement key is held. Sampled on the render thread;
+    // GetAsyncKeyState is process-wide, so it is valid from either thread.
+    bool FlyInputHeld()
+    {
+        return KeyDown('W') || KeyDown('S') || KeyDown('A') || KeyDown('D') ||
+               KeyDown(VK_SPACE) || KeyDown(VK_SHIFT);
+    }
+
+    void ScheduleFlyStep(UObject* pawn, float dt)
+    {
+        // Idle means idle -- do not drop this check. Scheduling unconditionally
+        // dispatches GetControlRotation and SetMovementMode every frame while
+        // standing still, which fired the crash in ~5s with no input where idle
+        // fly had survived 90s.
+        if (!FlyInputHeld())
+            return;
+
+        // The pump IS the ProcessEvent hook; without it there is no game thread to
+        // borrow. Skip the step rather than move the pawn from here.
+        if (!InstallProcessEventHook())
+            return;
+
+        // Bank the elapsed time BEFORE the in-flight check below. A frame dropped
+        // there still happened, so discarding its dt would make fly speed track
+        // the drain rate instead of wall-clock time -- roughly halving it, since
+        // the render thread schedules faster than the pump drains.
+        for (float banked = g_flyPendingDt.load(std::memory_order_relaxed);
+             !g_flyPendingDt.compare_exchange_weak(banked, banked + dt,
+                                                   std::memory_order_relaxed); )
+        {
+        }
+
+        // One step in flight at a time: the render thread runs ahead of the drain,
+        // so without this the queue grows without bound and fly replays stale
+        // movement.
+        ULONGLONG nowMs = GetTickCount64();
+        if (g_flyStepPending.exchange(true))
+        {
+            ULONGLONG waitedMs = nowMs - g_flyStepQueuedMs.load(std::memory_order_relaxed);
+            if (waitedMs < kFlyStepStuckMs)
+                return;
+            LOG("Fly: the queued step has not drained in %llums -- the game-thread pump "
+                "looks stalled. Re-queuing.", waitedMs);
+        }
+        g_flyStepQueuedMs.store(nowMs, std::memory_order_relaxed);
+
+        QueueGameThread([pawn]()
+        {
+            // Consume unconditionally: an abandoned step must not leave its time
+            // banked for the next one to apply as a lurch.
+            float step = ClampDeltaSeconds(g_flyPendingDt.exchange(0.0f, std::memory_order_relaxed));
+            try
+            {
+                // Re-validate on arrival: this runs a frame or so after it was
+                // queued, and the pawn can die in between.
+                if (IsLiveObject(pawn))
+                {
+                    uint8_t* mv = nullptr;
+                    if (Mem::IsReadable(reinterpret_cast<uint8_t*>(pawn) + AH::Char_CharacterMovement, 8))
+                        mv = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(pawn) + AH::Char_CharacterMovement);
+                    if (mv)
+                        EnterFlyingMovementMode(pawn, mv);
+
+                    // Read the location here rather than trusting the render
+                    // thread's copy, which is a frame stale by now.
+                    FVector loc{};
+                    if (ReadActorLocationFast(pawn, loc))
+                        ApplyMinecraftFly(pawn, loc, step);
+                }
+            }
+            catch (...) {}
+            g_flyStepPending.store(false);
+        });
+    }
+
+    // RefreshFlyStreaming dispatches InvalidateStreaming and EnableLevelStreaming,
+    // so it is game-thread work; the enable / disable edges reach it from the
+    // render tick.
+    void ScheduleFlyStreamingRefresh(UObject* pawn)
+    {
+        if (!InstallProcessEventHook())
+            return;
+        QueueGameThread([pawn]()
+        {
+            try { if (IsLiveObject(pawn)) RefreshFlyStreaming(pawn, true); }
+            catch (...) {}
+        });
+    }
+
+    // Every user-facing teleport. Beyond the component move fly already does, these
+    // sweep: the blocking-hit query can fire OnComponentHit and BeginOverlap into
+    // blueprint code. The pawn is resolved on the game thread rather than captured
+    // here, so a death between the click and the drain cannot move a dead pawn.
+    void QueueTeleport(FVector dest, bool refreshStreaming, const char* what)
+    {
+        std::string label = what ? what : "Teleport";
+        if (!InstallProcessEventHook())
+        {
+            LOG("%s skipped: no game-thread pump (ProcessEvent hook unavailable).", label.c_str());
+            return;
+        }
+        QueueGameThread([dest, refreshStreaming, label]()
+        {
+            try
+            {
+                UObject* pawn = GetLocalPawn();
+                if (!SetActorLocation(pawn, dest, true))
+                {
+                    LOG("%s failed: pawn=%p", label.c_str(), (void*)pawn);
+                    return;
+                }
+                if (refreshStreaming)
+                    RefreshFlyStreaming(pawn, true);
+                LOG("%s %.1f %.1f %.1f", label.c_str(), dest.X, dest.Y, dest.Z);
+            }
+            catch (...) { LOG("%s: exception (ignored)", label.c_str()); }
+        });
     }
 
     bool InvokeTakeWeapon(UObject* pawn, UObject* asset)
@@ -9002,16 +9146,127 @@ namespace
         g_movementBackup.walkValid = false;
     }
 
+    // Going through the engine is what runs OnMovementModeChanged. Entering
+    // MOVE_Walking is where it does FindFloor, AdjustFloorHeight and
+    // SetBaseFromFloor and zeroes Velocity.Z. Game thread only -- dispatches a
+    // UFunction.
+    bool SetMovementModeViaEngine(uint8_t* mv, uint8_t mode)
+    {
+        UObject* movementObject = reinterpret_cast<UObject*>(mv);
+        UFunction* fn = CachedObjectClassFn(movementObject, "SetMovementMode");
+        if (!fn)
+            return false;
+        P_SetMovementMode p{ mode, 0 };
+        movementObject->ProcessEvent(fn, &p);
+        return true;
+    }
+
+    // The exit half of EnterFlyingMovementMode, reached from the render tick's
+    // disable edge, hence the queue. Milder than the entry direction: PhysWalking
+    // re-runs FindFloor by itself on the next tick.
+    void ScheduleLeaveFlyingMovementMode(uint8_t* mv, uint8_t mode)
+    {
+        if (!mv)
+            return;
+        if (!InstallProcessEventHook())
+        {
+            if (WriteUInt8Field(mv, AH::Move_MovementMode, mode))
+                LOG("Fly restored: MovementMode=%u by raw write (no game-thread pump); "
+                    "the floor and movement base are NOT re-found on this path.", (unsigned)mode);
+            return;
+        }
+        QueueGameThread([mv, mode]()
+        {
+            try
+            {
+                if (!IsLiveObject(reinterpret_cast<UObject*>(mv)) ||
+                    !Mem::IsReadable(mv + AH::Move_MovementMode, 1))
+                    return;
+                bool viaEngine = SetMovementModeViaEngine(mv, mode);
+                uint8_t& live = *reinterpret_cast<uint8_t*>(mv + AH::Move_MovementMode);
+                bool forced = live != mode;
+                if (forced)
+                    live = mode;
+                LOG("Fly restored: MovementMode=%u via %s", (unsigned)mode,
+                    viaEngine && !forced ? "SetMovementMode" : "raw write");
+            }
+            catch (...) {}
+        });
+    }
+
     void RestoreMovementFly()
     {
         if (g_movementBackup.flyValid && WriteFloatField(g_movementBackup.mv, AH::Move_MaxFlySpeed, g_movementBackup.flySpeed))
             LOG("Fly restored: MaxFlySpeed=%.1f", g_movementBackup.flySpeed);
-        if (g_movementBackup.modeValid && WriteUInt8Field(g_movementBackup.mv, AH::Move_MovementMode, g_movementBackup.mode))
-            LOG("Fly restored: MovementMode=%u", (unsigned)g_movementBackup.mode);
+        if (g_movementBackup.modeValid)
+            ScheduleLeaveFlyingMovementMode(g_movementBackup.mv, g_movementBackup.mode);
         g_movementBackup.flyValid = false;
         g_movementBackup.modeValid = false;
         if (!g_movementBackup.walkValid)
             g_movementBackup = {};
+    }
+
+    // The character's movement base -- the component it is standing on -- read by
+    // reflection so no new build-specific offset is introduced.
+    // ACharacter::BasedMovement is an FBasedMovementInfo whose MovementBase is a
+    // UPrimitiveComponent*.
+    UObject* ReadMovementBase(UObject* pawn)
+    {
+        if (!IsLiveObject(pawn))
+            return nullptr;
+        int basedOff = Reflect::FindPropertyOffset(pawn, "BasedMovement");
+        if (basedOff < 0)
+            return nullptr;
+        // Retried rather than latched: fly is usually enabled while the background
+        // short-name index is still building, so a one-shot lookup loses the
+        // movement-base log below for the session. FindObjectFast never scans.
+        static int baseOff = -1;
+        if (baseOff < 0)
+        {
+            UObject* info = FindObjectFast("Engine.BasedMovementInfo");
+            if (IsLiveObject(info))
+                baseOff = Reflect::FindPropertyOffsetInStruct(info, "MovementBase");
+        }
+        if (baseOff < 0)
+            return nullptr;
+        uint8_t* addr = reinterpret_cast<uint8_t*>(pawn) + basedOff + baseOff;
+        if (!Mem::IsReadable(addr, sizeof(void*)))
+            return nullptr;
+        return *reinterpret_cast<UObject**>(addr);
+    }
+
+    // A raw byte write to UCharacterMovementComponent::MovementMode sets the field
+    // but skips SetMovementMode -> OnMovementModeChanged, where leaving
+    // MOVE_Walking does CurrentFloor.Clear() and SetBase(NULL). The character then
+    // still references the component it was standing on; fly away, let that
+    // component's level stream out, and the game walks the dangling pointer on the
+    // next jump -- its own call, through its own stale pointer, uncatchable by us.
+    void EnterFlyingMovementMode(UObject* pawn, uint8_t* mv)
+    {
+        if (!Mem::IsReadable(mv + AH::Move_MovementMode, 1))
+            return;
+        uint8_t& mode = *reinterpret_cast<uint8_t*>(mv + AH::Move_MovementMode);
+        if (mode == AH::MOVE_Flying)
+            return; // steady state: no per-frame ProcessEvent
+
+        UObject* baseBefore = ReadMovementBase(pawn);
+
+        bool viaEngine = SetMovementModeViaEngine(mv, AH::MOVE_Flying);
+        // Fallback so fly still works if SetMovementMode cannot be resolved. It
+        // carries the dangling-base hazard above, so the log says so.
+        if (mode != AH::MOVE_Flying)
+        {
+            mode = AH::MOVE_Flying;
+            if (!viaEngine)
+                LOG("Fly: SetMovementMode unavailable; forced MovementMode=Flying by raw write. "
+                    "The stale movement base is NOT cleared on this path -- jumping may crash the game.");
+        }
+
+        UObject* baseAfter = ReadMovementBase(pawn);
+        LOG("Fly: entered MOVE_Flying via %s; movement base %p -> %p%s",
+            viaEngine ? "SetMovementMode" : "raw write",
+            (void*)baseBefore, (void*)baseAfter,
+            baseBefore && !baseAfter ? " (stale base cleared)" : "");
     }
 
     bool ApplyInventoryIgnoreOverWeight(UObject* inventory, bool ignore)
@@ -13588,49 +13843,25 @@ void Features::SavePosition()
     catch (...) { LOG("SavePosition: exception (ignored)"); }
 }
 
+// Both are menu clicks, i.e. the render thread.
 void Features::TeleportToSaved()
 {
-    try
+    if (!g_state.hasSaved)
     {
-        if (!g_state.hasSaved)
-        {
-            LOG("TeleportToSaved failed: no saved position.");
-            return;
-        }
-        UObject* pawn = GetLocalPawn();
-        if (!SetActorLocation(pawn, g_state.savedLocation, true))
-        {
-            LOG("TeleportToSaved failed: pawn=%p", (void*)pawn);
-            return;
-        }
-        LOG("Teleported to saved position %.1f %.1f %.1f",
-            g_state.savedLocation.X, g_state.savedLocation.Y, g_state.savedLocation.Z);
+        LOG("TeleportToSaved failed: no saved position.");
+        return;
     }
-    catch (...) { LOG("TeleportToSaved: exception (ignored)"); }
+    QueueTeleport(g_state.savedLocation, false, "Teleported to saved position");
 }
 
 void Features::ReturnToFlyStart()
 {
-    try
+    if (!g_state.hasFlyStart)
     {
-        if (!g_state.hasFlyStart)
-        {
-            LOG("ReturnToFlyStart failed: no fly start captured.");
-            return;
-        }
-
-        UObject* pawn = GetLocalPawn();
-        if (!SetActorLocation(pawn, g_state.flyStartLocation, true))
-        {
-            LOG("ReturnToFlyStart failed: pawn=%p", (void*)pawn);
-            return;
-        }
-
-        RefreshFlyStreaming(pawn, true);
-        LOG("Returned to fly start %.1f %.1f %.1f",
-            g_state.flyStartLocation.X, g_state.flyStartLocation.Y, g_state.flyStartLocation.Z);
+        LOG("ReturnToFlyStart failed: no fly start captured.");
+        return;
     }
-    catch (...) { LOG("ReturnToFlyStart: exception (ignored)"); }
+    QueueTeleport(g_state.flyStartLocation, true, "Returned to fly start");
 }
 
 void Features::RefillAmmoNow()
@@ -15228,12 +15459,12 @@ static void TickImpl()
             st.hasFlyStart = true;
             LOG("Fly start captured %.1f %.1f %.1f", currentLoc.X, currentLoc.Y, currentLoc.Z);
         }
-        RefreshFlyStreaming(pawn, true);
+        ScheduleFlyStreamingRefresh(pawn);
     }
     else if (!freeFly && wasFreeFly)
     {
-        RefreshFlyStreaming(pawn, true);
-        LOG("Fly/noclip disabled; streaming assist refreshed at current pawn location.");
+        ScheduleFlyStreamingRefresh(pawn);
+        LOG("Fly/noclip disabled; streaming assist queued at current pawn location.");
     }
 
     // Noclip toggles the pawn's collision (edge-triggered, and re-applied if the
@@ -15270,10 +15501,9 @@ static void TickImpl()
 
             if (freeFly)
             {
-                *reinterpret_cast<uint8_t*>(mv + AH::Move_MovementMode) = AH::MOVE_Flying;
                 *reinterpret_cast<float*>(mv + AH::Move_MaxFlySpeed) = 600.0f * st.speedMult;
-                if (haveLoc)
-                    ApplyMinecraftFly(pawn, currentLoc, dt);
+                // Movement mode + the actual move happen on the GAME thread.
+                ScheduleFlyStep(pawn, dt);
             }
 
             // super jump / low gravity: capture the original on first enable so
