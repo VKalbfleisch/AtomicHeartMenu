@@ -3431,11 +3431,18 @@ namespace
             target = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(G::moduleBase) + 0x1B93A50);
             g_fnHookTryFightStagingNative.store(target, std::memory_order_relaxed);
         }
-        if (!target || !Scanner::IsExecutableAddress(target, 8))
+        // RVA 0x1B93A50 is hardcoded from a Ghidra session on an OLDER build. On
+        // buildid 24534183 it lands two bytes inside a five-byte `call rel32` at
+        // RVA 0x1B93A4E, so an IsExecutableAddress guard would let MinHook rewrite
+        // that call's displacement.
+        if (!target || !Scanner::IsFunctionEntry(target))
         {
             bool already = g_hookTwinFightStagingHookAttempted.exchange(true, std::memory_order_relaxed);
             if (!already)
-                LOG_HOOK("TryActivateFightStagingAbility native hook unavailable target=%p moduleBase=%p", target, (void*)G::moduleBase);
+                LOG_HOOK("TryActivateFightStagingAbility native hook REFUSED: target=%p is not a "
+                         "function entry on this build (hardcoded RVA 0x1B93A50 is stale). "
+                         "Not hooking -- detouring mid-instruction corrupts the game's code. "
+                         "moduleBase=%p", target, (void*)G::moduleBase);
             return false;
         }
 
@@ -3476,8 +3483,17 @@ namespace
 
         void* target = reinterpret_cast<void*>(
             reinterpret_cast<uintptr_t>(G::moduleBase) + 0x1CA06E0);
-        if (!Scanner::IsExecutableAddress(target, 8))
+        // Stale on buildid 24534183 as well, 0x32 bytes into the function at
+        // 0x1CA06AE -- on an instruction boundary rather than mid-instruction like
+        // the selector above, but still not an entry, so still refused.
+        if (!Scanner::IsFunctionEntry(target))
+        {
+            static std::atomic<bool> logged{ false };
+            if (!logged.exchange(true))
+                LOG_HOOK("ActionContainerFactory native hook REFUSED: target=%p is not a function "
+                         "entry on this build (hardcoded RVA 0x1CA06E0 is stale).", target);
             return false;
+        }
 
         MH_STATUS status = MH_CreateHook(target,
             reinterpret_cast<void*>(&hkActionContainerFactory),

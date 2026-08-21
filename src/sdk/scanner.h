@@ -45,6 +45,20 @@ namespace Scanner
                      Scope scope = Scope::ExecutableSections);
 
     bool IsExecutableAddress(const void* address, size_t size = 1);
+
+    // Is `address` the FIRST byte of a real function? Gate every detour on this,
+    // never on IsExecutableAddress, which is true of every byte in .text including
+    // mid-instruction -- so a shifted RVA passes it and MinHook then stamps its
+    // 5-byte JMP across an instruction boundary, rewriting the game's own code.
+    //
+    // The x64 exception directory lists every function's start, so an entry that
+    // does not BEGIN at `address` is exact proof this is not one. Beginning there
+    // is not proof that it IS one: a linker-split function has an entry per range,
+    // so its cold half begins one too. Those are refused as well.
+    //
+    // Leaf functions with no unwind data have no entry and are refused too.
+    // Refusing to hook is recoverable; hooking mid-instruction is not.
+    bool IsFunctionEntry(const void* address);
     uint8_t* DecodeRel32CallTarget(uint8_t* call);
     uint8_t* DecodeRel32JumpTarget(uint8_t* jump);
 
