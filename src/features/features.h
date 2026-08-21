@@ -285,6 +285,9 @@ namespace Features
     void DumpNearbyVolumes();
     // Diagnostics: one-shot full state bundle + live toggle log status.
     void DebugDumpGameSnapshot();
+    // Diagnostics: diff every reflected member offset against offsets.h, naming
+    // any a patch has moved. Worker thread; results go to the log.
+    void DebugVerifyMemberOffsets();
     // Discovery: full named-field reflection dump of every loaded actor whose
     // class/name/path contains nameSubstr (e.g. "Larisa"), incl. its controller +
     // movement component. Runs on a worker thread (never freezes the game).

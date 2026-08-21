@@ -136,9 +136,17 @@ matching therefore still comes up on its own. Recovering the numbers by hand:
 1. `python tools/find_globals.py` - static analysis of the shipping exe, no game
    running and no Dumper-7. Prints paste-ready constants for the three globals plus
    `ExpectedImageSize`, and flags whichever entry in `offsets.h` has gone stale.
-2. Re-inject **Dumper-7** for anything beyond the globals - the class and function
-   member offsets in `Offsets::AH` need a real SDK dump, which this tool does not
-   attempt.
+2. **Debug tab → Verify member offsets** - reads the member layer off the running
+   game. Every `UPROPERTY` carries its own byte offset in the engine's reflection
+   data, so a class's property list answers "where does `RootComponent` live on
+   *this* build" directly. The button diffs those live offsets against the
+   constants in `offsets.h` and writes the verdict per entry to the log, naming
+   the ones a patch has moved and the value to set them to. No Dumper-7 run.
+3. Re-inject **Dumper-7** for what reflection cannot reach - the native
+   `UObject`/`UStruct`/`FField` chain, the `GObjects` array layout and
+   `VFUNC_PROCESSEVENT` are not `UPROPERTY`s. They are also the values a game
+   patch is least likely to move, since they come from the engine version rather
+   than from the game's own classes.
 
 Validation is not just a null check: the object sweep confirms `GObjects` and
 `GNames` by resolving core UE4 type names, and `ValidateGWorld()` walks `*GWorld`
@@ -303,6 +311,18 @@ Built with `/EHa`, so `catch(...)` traps **both** C++ exceptions and access
 violations. Layered defenses:
 
 - `Mem::IsReadable()` gates **every** game-memory dereference.
+- `Mem::IsExecutable()` gates every **indirect call** into game code. Readable is
+  not executable: a bad function pointer that merely reads fine still DEP-faults
+  on the call, and that fault happens after control has left our code, where
+  `/EHa` and `catch(...)` can no longer contain it. `UObject::ProcessEvent`
+  returns instead of dispatching when its vtable slot fails this check.
+- `UE::IsLiveObject()` gates every **cached** game pointer. Destroying a `UObject`
+  does not unmap its memory - the allocator hands the block straight back out - so
+  a dead object stays readable and its fields return whatever now occupies those
+  bytes. Liveness is asked of the engine's own registry instead: a live object is
+  reachable at its own `InternalIndex` in `GObjects`, and destruction clears that
+  slot. `IsLiveObjectNamed()` adds a full-name confirmation for caches keyed by
+  name, since a recycled slot can hold a different live object.
 - `ValidateSdk()` requires real core UE4 names (`Object`, `Class`, `Property`…)
   before flipping `sdkReady` - wrong offsets degrade to "SDK: NOT resolved".
 - `GetFullName()` caps the `Outer` chain depth (no runaway strings).

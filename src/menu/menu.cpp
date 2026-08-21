@@ -1308,6 +1308,18 @@ void Menu::Render()
                 ImGui::TextWrapped("Last diagnostics: %s", dir);
 
             ImGui::Spacing();
+            ImGui::SeparatorText("Offset verification");
+            ImGui::TextWrapped("Reads every reflected member offset off the running game and diffs "
+                               "it against offsets.h, so a game patch names the entries it moved "
+                               "instead of showing up as a silent misbehaviour. No Dumper-7 run "
+                               "needed. Results go to AtomicHeartMenu.log.");
+            if (ImGui::Button("Verify member offsets", ImVec2(-FLT_MIN, 0)))
+            {
+                LOG("UI: member offset verification requested");
+                Features::DebugVerifyMemberOffsets();
+            }
+
+            ImGui::Spacing();
             ImGui::SeparatorText("Crash guard");
             auto skipper = ExceptionGuard::GetInstructionSkipperOptions();
             bool skipperChanged = false;

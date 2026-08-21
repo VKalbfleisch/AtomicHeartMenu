@@ -56,4 +56,9 @@ namespace Reflect
 
     // Resolve the byte offset of a named property within its container (or -1).
     int FindPropertyOffset(UE::UObject* obj, const char* propName);
+
+    // Same, but from a UStruct -- a UClass or UScriptStruct -- rather than an
+    // instance. The class carries the property list, so the offset is readable the
+    // moment the class loads, with no instance in existence.
+    int FindPropertyOffsetInStruct(UE::UObject* structOrClass, const char* propName);
 }

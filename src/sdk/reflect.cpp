@@ -289,14 +289,14 @@ void Reflect::WriteObjectRefJson(std::ostream& os, UObject* o)
 
 namespace
 {
-    // Walk obj's class chain ChildProperties for a property named `propName`.
-    // Returns the FField* (as bytes) and writes its value offset to *outOffset.
-    uint8_t* FindPropertyField(UObject* obj, const char* propName, int32_t* outOffset)
+    // Walk a UStruct's own ChildProperties, then its SuperStruct chain, for a
+    // property named `propName`. Returns the FField* (as bytes) and writes its
+    // value offset to *outOffset.
+    uint8_t* FindPropertyFieldInStruct(UObject* structOrClass, const char* propName, int32_t* outOffset)
     {
         if (outOffset) *outOffset = -1;
-        if (!Mem::IsReadable(obj, 0x30) || !propName || !*propName) return nullptr;
-        UObject* cur = nullptr;
-        try { cur = obj->Class(); } catch (...) {}
+        if (!propName || !*propName) return nullptr;
+        UObject* cur = structOrClass;
         for (int classDepth = 0; Mem::IsReadable(cur, 0x60) && classDepth < 64; ++classDepth)
         {
             uint8_t* prop = nullptr;
@@ -322,12 +322,29 @@ namespace
         }
         return nullptr;
     }
+
+    // Same lookup, entered from an instance instead of from its class.
+    uint8_t* FindPropertyField(UObject* obj, const char* propName, int32_t* outOffset)
+    {
+        if (outOffset) *outOffset = -1;
+        if (!Mem::IsReadable(obj, 0x30)) return nullptr;
+        UObject* cls = nullptr;
+        try { cls = obj->Class(); } catch (...) { return nullptr; }
+        return FindPropertyFieldInStruct(cls, propName, outOffset);
+    }
 }
 
 int Reflect::FindPropertyOffset(UObject* obj, const char* propName)
 {
     int32_t off = -1;
     try { FindPropertyField(obj, propName, &off); } catch (...) { off = -1; }
+    return off;
+}
+
+int Reflect::FindPropertyOffsetInStruct(UObject* structOrClass, const char* propName)
+{
+    int32_t off = -1;
+    try { FindPropertyFieldInStruct(structOrClass, propName, &off); } catch (...) { off = -1; }
     return off;
 }
 

@@ -13104,6 +13104,198 @@ int Features::AiZoneSnapshotCount()
     return (int)g_zoneSnapshot.size();
 }
 
+// =======================================================================
+//  MEMBER-OFFSET VERIFICATION  --  read the live game instead of a dump
+// =======================================================================
+//  The member-layer counterpart to tools/find_globals.py, needing no external
+//  tool: every UPROPERTY carries its own byte offset in the engine's reflection
+//  data, so a class's ChildProperties list answers "where does RootComponent
+//  live on THIS build" directly.
+//
+//  Reflected members only. The UObject/UStruct/FField chain, the GObjects array
+//  layout and VFUNC_PROCESSEVENT are not UPROPERTYs and still need a Dumper-7
+//  dump.
+//
+//  Read-only reflection, no ProcessEvent, so a worker thread cannot freeze the
+//  game thread.
+namespace
+{
+    struct OffsetCheck
+    {
+        const char* className;   // FindObjectFast needle, "Package.Class"
+        const char* propName;    // the UPROPERTY name as the engine reports it
+        int         expected;    // what offsets.h says today
+        const char* constant;    // its name, so the log names what to edit
+    };
+
+    // Every member offset that reflection can reach. Engine-layer names are stock
+    // UE4 and should always resolve; an AtomicHeart name that does not resolve is
+    // reported as unresolved rather than as a mismatch, because a wrong guess at
+    // the property name proves nothing about the offset.
+    constexpr OffsetCheck kOffsetChecks[] =
+    {
+        // ---- Engine layer ----
+        { "Engine.Actor",                     "RootComponent",        Offsets::O_Actor_RootComponent,      "O_Actor_RootComponent" },
+        { "Engine.Actor",                     "CustomTimeDilation",   Offsets::O_Actor_CustomTimeDilation, "O_Actor_CustomTimeDilation" },
+        { "Engine.SceneComponent",            "RelativeLocation",     Offsets::O_Scene_RelativeLocation,   "O_Scene_RelativeLocation" },
+        { "Engine.World",                     "OwningGameInstance",   Offsets::O_World_GameInstance,       "O_World_GameInstance" },
+        { "Engine.World",                     "PersistentLevel",      Offsets::O_World_PersistentLevel,    "O_World_PersistentLevel" },
+        { "Engine.World",                     "Levels",               Offsets::O_World_Levels,             "O_World_Levels" },
+        { "Engine.Level",                     "Actors",               Offsets::O_Level_Actors,             "O_Level_Actors" },
+        { "Engine.GameInstance",              "LocalPlayers",         Offsets::O_GameInst_LocalPlayers,    "O_GameInst_LocalPlayers" },
+        { "Engine.Player",                    "PlayerController",     Offsets::O_Player_PlayerController,  "O_Player_PlayerController" },
+        { "Engine.PlayerController",          "AcknowledgedPawn",     Offsets::O_Controller_Pawn,          "O_Controller_Pawn" },
+        { "Engine.PlayerController",          "PlayerCameraManager",  Offsets::O_PC_CameraManager,         "O_PC_CameraManager" },
+        { "Engine.Controller",                "Pawn",                 Offsets::O_BaseController_Pawn,      "O_BaseController_Pawn" },
+        { "Engine.Pawn",                      "Controller",           Offsets::O_Pawn_Controller,          "O_Pawn_Controller" },
+        { "Engine.CameraComponent",           "FieldOfView",          AH::Camera_FieldOfView,              "AH::Camera_FieldOfView" },
+        { "Engine.Character",                 "CharacterMovement",    AH::Char_CharacterMovement,          "AH::Char_CharacterMovement" },
+        { "Engine.MovementComponent",         "Velocity",             AH::Move_Velocity,                   "AH::Move_Velocity" },
+        { "Engine.CharacterMovementComponent","GravityScale",         AH::Move_GravityScale,               "AH::Move_GravityScale" },
+        { "Engine.CharacterMovementComponent","JumpZVelocity",        AH::Move_JumpZVelocity,              "AH::Move_JumpZVelocity" },
+        { "Engine.CharacterMovementComponent","MovementMode",         AH::Move_MovementMode,               "AH::Move_MovementMode" },
+        { "Engine.CharacterMovementComponent","MaxWalkSpeed",         AH::Move_MaxWalkSpeed,               "AH::Move_MaxWalkSpeed" },
+        { "Engine.CharacterMovementComponent","MaxFlySpeed",          AH::Move_MaxFlySpeed,                "AH::Move_MaxFlySpeed" },
+        { "Engine.CharacterMovementComponent","AirControl",           AH::Move_AirControl,                 "AH::Move_AirControl" },
+
+        // ---- AtomicHeart layer ----
+        { "AtomicHeart.AHBaseCharacter",      "FPCamera",             AH::Char_FPCamera,                   "AH::Char_FPCamera" },
+        { "AtomicHeart.AHBaseCharacter",      "TPCamera",             AH::Char_TPCamera,                   "AH::Char_TPCamera" },
+        { "AtomicHeart.AHPlayerCharacter",    "InventoryPlayer",      AH::Char_InventoryPlayer,            "AH::Char_InventoryPlayer" },
+        { "AtomicHeart.EquipableItem",        "Mesh",                 AH::Weapon_Mesh,                     "AH::Weapon_Mesh" },
+        { "AtomicHeart.EquipableItem",        "ItemDataAsset",        AH::Weapon_ItemDataAsset,            "AH::Weapon_ItemDataAsset" },
+        { "EasyBallistics.EBBarrel",          "Ammo",                 AH::EBBarrel_Ammo,                   "AH::EBBarrel_Ammo" },
+        { "AtomicHeart.AIMixedNavigationCharacter", "Mercuna3DMovement", AH::Mixed_Mercuna3DMovement,      "AH::Mixed_Mercuna3DMovement" },
+        { "AtomicHeart.AIMixedNavigationCharacter", "MercunaNavigation", AH::Mixed_MercunaNavigation,      "AH::Mixed_MercunaNavigation" },
+    };
+
+    volatile LONG g_offsetVerifyRunning = 0;
+
+    // Is this object something whose ChildProperties/SuperStruct we may walk?
+    //
+    // The table entries are name NEEDLES, and FindObjectFast matches them as
+    // substrings of a full name among the objects sharing the last name token. So
+    // "Engine.Level" asks for the UClass but would accept any object named Level
+    // whose path happens to contain it. Reading UStruct fields off one of those is
+    // guarded and will not fault, but it can follow unrelated pointers and produce
+    // a plausible-looking number -- and this tool's whole output is a constant it
+    // tells the user to paste into offsets.h, so a wrong number is worse here than
+    // no number.
+    //
+    // Every UStruct's own class is either a *Class metaclass (Class,
+    // BlueprintGeneratedClass, DynamicClass, ...) or ScriptStruct. That is one
+    // string compare and needs no extra lookup to bootstrap.
+    bool IsStructLike(UObject* object)
+    {
+        if (!IsLiveObject(object))
+            return false;
+        std::string meta;
+        try { meta = object->Class()->GetName(); } catch (...) { return false; }
+        if (meta == "ScriptStruct")
+            return true;
+        return meta.size() >= 5 && meta.compare(meta.size() - 5, 5, "Class") == 0;
+    }
+
+    DWORD WINAPI VerifyOffsetsThread(LPVOID)
+    {
+        int matched = 0, moved = 0, unresolvedProp = 0, unresolvedClass = 0;
+        try
+        {
+            // Class lookups go through the background short-name index. Kick it off
+            // here so a run started seconds after injection warms it rather than
+            // reporting every class as unresolved.
+            UE::StartObjectNameIndex();
+            LOG("VerifyOffsets: checking %d reflected member offsets against offsets.h",
+                (int)(sizeof(kOffsetChecks) / sizeof(kOffsetChecks[0])));
+
+            const char* lastClassName = nullptr;
+            UClass*     lastClass     = nullptr;
+            for (const OffsetCheck& check : kOffsetChecks)
+            {
+                // The table is grouped by class, so one lookup usually covers a run.
+                if (lastClassName != check.className)
+                {
+                    lastClassName = check.className;
+                    lastClass     = FindObjectFast(check.className);
+                }
+                if (!IsStructLike(lastClass))
+                {
+                    ++unresolvedClass;
+                    if (IsLiveObject(lastClass))
+                    {
+                        // Resolved to something, but not to a class.
+                        std::string wrong;
+                        try { wrong = lastClass->GetFullName(); } catch (...) {}
+                        LOG("VerifyOffsets: %-28s resolved to a non-class object (%s) -- "
+                            "%s not checked, and the needle needs tightening",
+                            check.className, wrong.c_str(), check.constant);
+                    }
+                    else
+                    {
+                        LOG("VerifyOffsets: %-28s class not resolved (%s not checked)",
+                            check.className, check.constant);
+                    }
+                    continue;
+                }
+
+                int actual = Reflect::FindPropertyOffsetInStruct(lastClass, check.propName);
+                if (actual < 0)
+                {
+                    ++unresolvedProp;
+                    LOG("VerifyOffsets: %-28s %-22s NOT REFLECTED -- the property name is wrong "
+                        "for this build, so %s is unverified (not necessarily wrong)",
+                        check.className, check.propName, check.constant);
+                }
+                else if (actual == check.expected)
+                {
+                    ++matched;
+                    LOG("VerifyOffsets: %-28s %-22s ok 0x%X (%s)",
+                        check.className, check.propName, actual, check.constant);
+                }
+                else
+                {
+                    ++moved;
+                    LOG("VerifyOffsets: %-28s %-22s MOVED: offsets.h says 0x%X, the game says 0x%X "
+                        "-- set %s = 0x%X",
+                        check.className, check.propName, check.expected, actual,
+                        check.constant, actual);
+                }
+            }
+        }
+        catch (...) { LOG("VerifyOffsets: exception (ignored)"); }
+
+        if (moved == 0 && unresolvedProp == 0 && unresolvedClass == 0)
+            LOG("VerifyOffsets: DONE -- all %d reflected offsets match this build.", matched);
+        else
+            LOG("VerifyOffsets: DONE -- %d ok, %d MOVED, %d property name unresolved, "
+                "%d class unresolved. Only the MOVED ones need an offsets.h edit; an "
+                "unresolved class usually means the background name index was still "
+                "building, so run it again in a few seconds.",
+                matched, moved, unresolvedProp, unresolvedClass);
+
+        InterlockedExchange(&g_offsetVerifyRunning, 0);
+        return 0;
+    }
+}
+
+void Features::DebugVerifyMemberOffsets()
+{
+    if (!G::sdkReady.load()) { LOG("VerifyOffsets: SDK not ready"); return; }
+    if (InterlockedCompareExchange(&g_offsetVerifyRunning, 1, 0) != 0)
+    {
+        LOG("VerifyOffsets: already running");
+        return;
+    }
+    HANDLE t = CreateThread(nullptr, 0, VerifyOffsetsThread, nullptr, 0, nullptr);
+    if (!t)
+    {
+        InterlockedExchange(&g_offsetVerifyRunning, 0);
+        LOG("VerifyOffsets: thread spawn failed err=%lu", GetLastError());
+        return;
+    }
+    CloseHandle(t);
+}
+
 // Diagnostic: log nearby volume/trigger actors so we can identify the out-of-bounds
 // teleporter (e.g. the lighthouse one) and disable it precisely next. Background
 // thread (reads names over the level actor list -- no ProcessEvent).

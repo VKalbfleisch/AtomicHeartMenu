@@ -49,12 +49,19 @@ This DLL must never crash the game. Follow the existing safety model:
 
 - Guard **every** game-memory dereference with `Mem::IsReadable` before you read or
   write it.
+- Guard every **indirect call** into game code with `Mem::IsExecutable`, never with
+  `Mem::IsReadable`. Readable is not executable, and a bad function pointer that
+  reads fine still DEP-faults on the call - after control has left our code, where
+  `catch(...)` can no longer reach it.
 - Wrap any risky operation (anything that calls into game code) in `try/catch`. The
   build uses `/EHa`, so `catch(...)` also traps access violations.
 - Do not run structural or heavy work on the render (Present) thread. Use the
   worker thread or the game-thread pump, the way the existing features do.
 - Re-validate cached actors immediately before each `ProcessEvent`; they can go
-  stale between frames.
+  stale between frames. Use `UE::IsLiveObject` (or `UE::IsLiveObjectNamed` when the
+  cache is keyed by name) - **not** `Mem::IsReadable`, which cannot answer this.
+  Destroying a `UObject` does not unmap its memory, so a dead object stays readable
+  and its fields return whatever now occupies the recycled block.
 - Do not reintroduce the native nav / behavior-tree calls that were deliberately
   removed for crashing.
 
