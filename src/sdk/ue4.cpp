@@ -98,8 +98,8 @@ namespace
         { "Function /Script/AtomicHeart.DebugSubsystem.CompleteAllActiveQuests", 0x407E },
         { "Function /Script/AtomicHeart.DebugSubsystem.PromoteAllActiveQuests", 0x40A9 },
         { "Function /Script/AIModule.AIBlueprintHelperLibrary.SimpleMoveToActor", 0x55B4 },
-        { "StreamingUtils AtomicHeart.Default__StreamingUtils", 0x10855 },
-        { "SubsystemUtils AtomicHeart.Default__SubsystemUtils", 0x10858 },
+        { "StreamingUtils /Script/AtomicHeart.Default__StreamingUtils", 0x10855 },
+        { "SubsystemUtils /Script/AtomicHeart.Default__SubsystemUtils", 0x10858 },
         { "DebugSubsystem_0", 0x12A5C },
         { "BP_WorldStreamingSubsystem_C_0", 0x134F8 },
 

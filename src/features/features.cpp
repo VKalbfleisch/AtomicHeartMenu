@@ -1408,7 +1408,11 @@ namespace
             return cached.Pin(found);
         }
 
-        UObject* lib = CachedObject("SubsystemUtils AtomicHeart.Default__SubsystemUtils");
+        // Needles are substrings of GetFullName(), which is "<Class>
+        // <Package>.<Name>" with the package spelled in full, the same shape the
+        // Fn_* constants use. Drop the "/Script/" and the needle never matches and
+        // the lookup returns null forever, in silence.
+        UObject* lib = CachedObject("SubsystemUtils /Script/AtomicHeart.Default__SubsystemUtils");
         UFunction* fn = CachedFn(AH::Fn_GetAHWorldStreamingSubsystem);
         if (lib && fn)
         {
@@ -1435,7 +1439,7 @@ namespace
 
     bool InvalidateStreaming(UObject* context)
     {
-        UObject* lib = CachedObject("StreamingUtils AtomicHeart.Default__StreamingUtils");
+        UObject* lib = CachedObject("StreamingUtils /Script/AtomicHeart.Default__StreamingUtils");
         UFunction* fn = CachedFn(AH::Fn_InvalidateStreaming);
         // The caller passes its pawn here, and the game dereferences it to reach
         // the world, so it has to be live rather than merely readable.
