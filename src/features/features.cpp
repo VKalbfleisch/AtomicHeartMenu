@@ -598,6 +598,26 @@ namespace
             // UFunction dispatch is game-thread-only in UE4) and never switch.
             unsigned long expected = 0;
             g_gameThreadId.compare_exchange_strong(expected, tid);
+            static std::atomic<bool> reported{ false };
+            if (!reported.exchange(true))
+            {
+                // The latch above assumes the first thread to reach a safe
+                // ProcessEvent callsite is the game thread, but UE also dispatches
+                // UFunctions from task-graph and async-loading workers. The thread
+                // owning the game window is the one that really is.
+                DWORD windowThread = G::hGameWindow
+                    ? GetWindowThreadProcessId(static_cast<HWND>(G::hGameWindow), nullptr) : 0;
+                unsigned long latched = g_gameThreadId.load();
+                // Absent window handle reports UNKNOWN, not MISMATCH: a false
+                // "wrong" here is worse than no line at all.
+                LOG("Game-thread pump: draining on tid=%lu, latched=%lu, window (game) thread=%lu -> %s",
+                    tid, latched, windowThread,
+                    !windowThread
+                        ? "UNKNOWN -- no game window handle yet, cannot compare"
+                        : (latched == windowThread
+                            ? "MATCH"
+                            : "MISMATCH -- tasks are draining on a worker, not the game thread"));
+            }
             if (tid == g_gameThreadId.load())
             {
                 // Drain at most a few tasks per safe callsite so a pile-up never does
@@ -13442,20 +13462,98 @@ namespace
 
     volatile LONG g_offsetVerifyRunning = 0;
 
-    // Is this object something whose ChildProperties/SuperStruct we may walk?
+    // ---- hardcoded native-hook RVAs ---------------------------------------
     //
-    // The table entries are name NEEDLES, and FindObjectFast matches them as
-    // substrings of a full name among the objects sharing the last name token. So
-    // "Engine.Level" asks for the UClass but would accept any object named Level
-    // whose path happens to contain it. Reading UStruct fields off one of those is
-    // guarded and will not fault, but it can follow unrelated pointers and produce
-    // a plausible-looking number -- and this tool's whole output is a constant it
-    // tells the user to paste into offsets.h, so a wrong number is worse here than
-    // no number.
+    // Raw addresses copied from Ghidra sessions on whatever build was current at
+    // the time. Unlike a wrong member offset, a stale one here does not read
+    // garbage, it WRITES -- see Scanner::IsFunctionEntry, and issue #3.
+    //
+    // IsFunctionEntry makes each install fail closed, but silently, leaving
+    // someone to discover why a feature stopped working. Reporting at injection
+    // names a patched build up front, the way the image-size check does.
+    //
+    // Both are stale on buildid 24534183.
+    struct NativeHookRva
+    {
+        uintptr_t   rva;
+        const char* what;
+    };
+
+    constexpr NativeHookRva kNativeHookRvas[] =
+    {
+        { 0x1B93A50, "Hook Twin fight-staging selector" },
+        { 0x1CA06E0, "Hook Twin action-container factory" },
+    };
+
+    void LogNativeHookRvaSelfCheck()
+    {
+        if (!G::moduleBase)
+            return;
+        int stale = 0;
+        for (const NativeHookRva& entry : kNativeHookRvas)
+        {
+            void* target = reinterpret_cast<void*>(
+                reinterpret_cast<uintptr_t>(G::moduleBase) + entry.rva);
+            if (Scanner::IsFunctionEntry(target))
+                continue;
+            ++stale;
+            LOG_HOOK("RVA self-check: 0x%llX (%s) is NOT a function entry on this build -- "
+                     "STALE. The detour will be refused; the feature is off until the address "
+                     "is re-derived.",
+                     (unsigned long long)entry.rva, entry.what);
+        }
+        if (!stale)
+            LOG_HOOK("RVA self-check: all %d hardcoded native-hook RVAs are function entries.",
+                     (int)(sizeof(kNativeHookRvas) / sizeof(kNativeHookRvas[0])));
+    }
+
+    // ---- ProcessEvent params-struct sizes ---------------------------------
+    //
+    // Every P_* struct below is a STACK BUFFER that ProcessEvent hands to game
+    // code, which writes its out-params and return value straight into it. The
+    // sizes are hardcoded from a Dumper-7 dump of a DIFFERENT build (18319896),
+    // and static_assert only proves our struct is the size we said -- not that
+    // the size is right for the game now running.
+    //
+    // An undersized struct is not a wrong value, it is memory corruption: the
+    // game writes past the end of a local, smashing the caller's frame.
+    //
+    // NATIVE UFunctions only. PropertiesSize is params plus script locals; a
+    // native has no locals, so it equals the params block, but a blueprint
+    // function's does not and would be reported UNDERSIZED here for no reason.
+    // offsets.h carries no O_UFunction_ParmsSize to compare against instead.
+    struct ParamsCheck
+    {
+        const char* funcName;    // /Script/... full name, as passed to CachedFn
+        int         ourSize;     // sizeof(the P_* struct we pass)
+        const char* structName;
+    };
+
+    const ParamsCheck kParamsChecks[] =
+    {
+        // Fly / noclip path -- the one issue #3 ran through.
+        { AH::Fn_SetActorLocation,        (int)sizeof(P_SetActorLocation),  "P_SetActorLocation" },
+        { AH::Fn_GetActorLocation,        (int)sizeof(P_GetActorLocation),  "P_GetActorLocation" },
+        { AH::Fn_GetControlRotation,      (int)sizeof(P_GetControlRotation),"P_GetControlRotation" },
+        { AH::Fn_SetActorEnableCollision, (int)sizeof(P_BoolParam),         "P_BoolParam" },
+        { AH::Fn_SetActorScale3D,         (int)sizeof(FVector),             "FVector (SetActorScale3D)" },
+        { AH::Fn_SetMovementMode,         (int)sizeof(P_SetMovementMode),   "P_SetMovementMode" },
+        // Streaming assist.
+        { AH::Fn_InvalidateStreaming,     (int)sizeof(P_WorldContext),      "P_WorldContext" },
+        { AH::Fn_EnableLevelStreaming,    (int)sizeof(P_BoolParam),         "P_BoolParam" },
+        { AH::Fn_GetAHWorldStreamingSubsystem, (int)sizeof(P_ObjectReturn), "P_ObjectReturn" },
+    };
+
+    // The table entries are NEEDLES: FindObjectFast matches them as substrings
+    // among the objects sharing the last name token, so "Engine.Level" would also
+    // accept any object named Level whose path contains it. Walking UStruct fields
+    // off one of those is guarded and will not fault, but it can follow unrelated
+    // pointers to a plausible-looking number -- and this tool's output is a
+    // constant the user is told to paste into offsets.h.
     //
     // Every UStruct's own class is either a *Class metaclass (Class,
-    // BlueprintGeneratedClass, DynamicClass, ...) or ScriptStruct. That is one
-    // string compare and needs no extra lookup to bootstrap.
+    // BlueprintGeneratedClass, DynamicClass, ...) or ScriptStruct, so one string
+    // compare bootstraps with no extra lookup.
     bool IsStructLike(UObject* object)
     {
         if (!IsLiveObject(object))
@@ -13534,6 +13632,52 @@ namespace
             }
         }
         catch (...) { LOG("VerifyOffsets: exception (ignored)"); }
+
+        // ---- params-struct sizes -------------------------------------------
+        int paramsOk = 0, paramsBad = 0, paramsUnresolved = 0;
+        try
+        {
+            LOG("VerifyParams: checking %d ProcessEvent params-struct sizes against UFunction::PropertiesSize",
+                (int)(sizeof(kParamsChecks) / sizeof(kParamsChecks[0])));
+            for (const ParamsCheck& check : kParamsChecks)
+            {
+                UFunction* fn = FindObjectFast(check.funcName);
+                if (!IsLiveObject(fn) ||
+                    !Mem::IsReadable((uint8_t*)fn + Offsets::O_UStruct_PropertiesSize, 4))
+                {
+                    ++paramsUnresolved;
+                    LOG("VerifyParams: %-56s function not resolved (%s unchecked)",
+                        check.funcName, check.structName);
+                    continue;
+                }
+                int gameSize = *reinterpret_cast<int32_t*>((uint8_t*)fn + Offsets::O_UStruct_PropertiesSize);
+                if (gameSize == check.ourSize)
+                {
+                    ++paramsOk;
+                    LOG("VerifyParams: %-34s ok 0x%X (%s)",
+                        check.structName, gameSize, check.funcName);
+                }
+                else
+                {
+                    ++paramsBad;
+                    LOG("VerifyParams: %-34s %s -- ours is 0x%X, the game's params block is 0x%X (%s)%s",
+                        check.structName,
+                        check.ourSize < gameSize ? "UNDERSIZED -- STACK CORRUPTION" : "oversized (wasteful, not unsafe)",
+                        check.ourSize, gameSize, check.funcName,
+                        check.ourSize < gameSize
+                            ? " <<< the game writes past the end of our buffer on every call"
+                            : "");
+                }
+            }
+        }
+        catch (...) { LOG("VerifyParams: exception (ignored)"); }
+
+        if (paramsBad)
+            LOG("VerifyParams: DONE -- %d ok, %d MISMATCHED, %d unresolved. A mismatch where ours "
+                "is smaller corrupts the stack on every call to that function.",
+                paramsOk, paramsBad, paramsUnresolved);
+        else
+            LOG("VerifyParams: DONE -- %d ok, 0 mismatched, %d unresolved.", paramsOk, paramsUnresolved);
 
         if (moved == 0 && unresolvedProp == 0 && unresolvedClass == 0)
             LOG("VerifyOffsets: DONE -- all %d reflected offsets match this build.", matched);
@@ -13788,6 +13932,7 @@ void Features::Prewarm()
         FindObjectFast(AH::Cls_MeshComponent);
         FindObjectFast(AH::Cls_Light);
         StartObjectNameIndex();
+        LogNativeHookRvaSelfCheck();
 
         LOG("Prewarm complete in %llums", GetTickCount64() - startMs);
     }

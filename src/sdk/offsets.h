@@ -263,6 +263,9 @@ namespace Offsets
         constexpr const char* Fn_LaunchCharacter = "Function /Script/Engine.Character.LaunchCharacter";             // ragdoll-launch enemies skyward
         constexpr const char* Fn_BaseWeapon_FullUpgrade = "Function /Script/AtomicHeart.BaseWeapon.FullUpgrade";    // max weapon upgrades
         constexpr const char* Fn_GetControlRotation = "Function /Script/Engine.Controller.GetControlRotation";
+        // Dispatched by short name through CachedObjectClassFn (the component's own
+        // class owns it); this full name is what the params-size verifier needs.
+        constexpr const char* Fn_SetMovementMode = "Function /Script/Engine.CharacterMovementComponent.SetMovementMode";
         constexpr const char* Fn_InvalidateStreaming = "Function /Script/AtomicHeart.StreamingUtils.InvalidateStreaming";
         constexpr const char* Fn_GetAHWorldStreamingSubsystem = "Function /Script/AtomicHeart.SubsystemUtils.GetAHWorldStreamingSubsystem";
         constexpr const char* Fn_EnableLevelStreaming = "Function /Script/AtomicHeart.AHWorldStreamingSubsystem.EnableLevelStreaming";
