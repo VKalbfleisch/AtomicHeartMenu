@@ -86,6 +86,25 @@ namespace UE
     // Object lookup over GObjects.
     int       NumObjects();
     UObject*  GetObjectByIndex(int index);
+
+    // Is this cached pointer still a live, registered UObject? Gate every cached
+    // game pointer on this, never on Mem::IsReadable: destroying a UObject does
+    // not unmap its memory, the allocator hands the block straight back out, and
+    // fast travel and level streaming churn exactly that way. The engine's own
+    // registry is the authority -- a live object is reachable at its own
+    // InternalIndex in GObjects, and destruction clears that slot.
+    //
+    // Known hole: an object marked PendingKill or Unreachable by GC still
+    // round-trips until ~UObjectBase runs, so this proves "still registered", not
+    // "safe to dispatch on".
+    bool      IsLiveObject(UObject* object);
+
+    // As above, plus a confirmation that this is still the object that was looked
+    // up: the slot can be recycled by a different object of a different class,
+    // which passes the liveness test but is not what the caller cached. `needle`
+    // is matched against GetFullName() the same way FindObject matches it.
+    bool      IsLiveObjectNamed(UObject* object, const char* needle);
+
     UObject*  FindObject(const char* name);           // substring of full name
     UObject*  FindObjectFast(const char* name);       // dumped index/name-index only; never scans
     void      StartObjectNameIndex();                 // background short-name index for fast assets

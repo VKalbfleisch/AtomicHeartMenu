@@ -762,6 +762,35 @@ UE::UObject* UE::GetObjectByIndex(int index)
     return Read<UObject*>(item, O_ObjectItem_Object);
 }
 
+bool UE::IsLiveObject(UObject* object)
+{
+    if (!Mem::IsReadable(object, 0x30))
+        return false;
+    try
+    {
+        // On a recycled block the index read here is whatever the new occupant
+        // wrote, which either fails GetObjectByIndex's bounds check or resolves
+        // to some other object -- both give the right answer.
+        int index = object->Index();
+        if (index < 0)
+            return false;
+        if (GetObjectByIndex(index) != object)
+            return false;
+        return Mem::IsReadable(object->Class(), 0x30);
+    }
+    catch (...) { return false; }
+}
+
+bool UE::IsLiveObjectNamed(UObject* object, const char* needle)
+{
+    if (!IsLiveObject(object))
+        return false;
+    if (!needle || !*needle)
+        return true;
+    try { return object->GetFullName().find(needle) != std::string::npos; }
+    catch (...) { return false; }
+}
+
 UE::UObject* UE::FindObject(const char* name)
 {
     if (!name || !*name)
@@ -777,7 +806,7 @@ UE::UObject* UE::FindObject(const char* name)
 
     std::lock_guard<std::mutex> lock(g_findObjectMutex);
     auto it = g_findObjectCache.find(needle);
-    if (it != g_findObjectCache.end() && Mem::IsReadable(it->second, 0x30))
+    if (it != g_findObjectCache.end() && IsLiveObjectNamed(it->second, needle.c_str()))
         return it->second;
 
     int n = NumObjects();
@@ -831,7 +860,9 @@ UE::UObject* UE::FindObjectFast(const char* name)
     {
         std::lock_guard<std::mutex> lock(g_findObjectMutex);
         auto it = g_findObjectCache.find(needle);
-        if (it != g_findObjectCache.end() && Mem::IsReadable(it->second, 0x30))
+        // GetFullName here is affordable because every caller fronts this with its
+        // own cache, so a hit only happens on a first-level miss.
+        if (it != g_findObjectCache.end() && IsLiveObjectNamed(it->second, needle.c_str()))
             return it->second;
     }
 

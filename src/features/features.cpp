@@ -823,16 +823,64 @@ namespace
         { "Plasmagun",  "DA_PlasmagunAmmo.DA_PlasmagunAmmo" },
     };
 
+    // Bounds how often one name can cost a full GObjects scan.
+    constexpr ULONGLONG kFnRescanThrottleMs = 5000;
+
     // Cache resolved UFunction* by full name so we only walk GObjects once.
     UFunction* CachedFn(const char* fullName)
     {
-        static std::unordered_map<std::string, UFunction*> cache;
+        // The two ways fn can be null need opposite treatment, hence everResolved.
+        // A name that has NEVER resolved is wrong for this build and retrying costs
+        // a scan forever. A name that resolved once and went stale can come back: a
+        // UFunction dies and is reborn with its class when a blueprint package
+        // unloads and reloads.
+        struct FnEntry { UFunction* fn = nullptr; bool everResolved = false; };
+
+        static std::unordered_map<std::string, FnEntry>    cache;
+        static std::unordered_map<std::string, ULONGLONG>  lastRescanMs;
         static std::mutex cacheMutex;
-        std::lock_guard<std::mutex> lock(cacheMutex);
+
+        std::unique_lock<std::mutex> lock(cacheMutex);
         auto it = cache.find(fullName);
-        if (it != cache.end()) return it->second;
+        if (it != cache.end())
+        {
+            if (it->second.fn && IsLiveObject(it->second.fn))
+                return it->second.fn;
+            if (!it->second.everResolved)
+                return nullptr;
+
+            // Stale. FindObjectFast never scans, so it is free to try every time.
+            if (UFunction* fast = FindObjectFast(fullName))
+            {
+                it->second.fn = fast;
+                LOG("Re-resolved %s -> %p (previous pointer went stale)", fullName, (void*)fast);
+                return fast;
+            }
+            it->second.fn = nullptr;
+        }
+
+        // FindFunction falls through to a full ~300k-object GObjects scan
+        // (650-900ms, measured) reached from the per-frame render tick, so it is
+        // rationed and runs with the lock RELEASED -- holding it would stall every
+        // thread wanting any cached function for the better part of a second.
+        // Stamping before the release is what makes a concurrent caller take the
+        // throttle branch rather than start a second scan of its own.
+        ULONGLONG nowMs = GetTickCount64();
+        auto rescan = lastRescanMs.find(fullName);
+        if (rescan != lastRescanMs.end() && nowMs - rescan->second < kFnRescanThrottleMs)
+            return nullptr;
+        lastRescanMs[fullName] = nowMs;
+
+        lock.unlock();
         UFunction* fn = FindFunction(fullName);
-        cache[fullName] = fn;
+        lock.lock();
+
+        // Re-look-up rather than reusing `it`: the map may have rehashed while the
+        // lock was released.
+        FnEntry& entry = cache[fullName];
+        entry.fn = fn;
+        if (fn)
+            entry.everResolved = true;
         LOG("%s %s -> %p", fn ? "Resolved" : "MISSING", fullName, (void*)fn);
         return fn;
     }
@@ -844,7 +892,9 @@ namespace
         static std::mutex cacheMutex;
         std::lock_guard<std::mutex> lock(cacheMutex);
         auto it = cache.find(name);
-        if (it != cache.end() && Mem::IsReadable(it->second, 0x30))
+        // Keyed by name, so liveness alone is not enough -- see IsLiveObjectNamed.
+        // FindObjectFast never scans, so re-resolving on a hit is cheap.
+        if (it != cache.end() && IsLiveObjectNamed(it->second, name))
             return it->second;
 
         UObject* obj = FindObjectFast(name);
@@ -875,7 +925,7 @@ namespace
         std::string key = std::string(className) + "::" + shortName;
         std::lock_guard<std::mutex> lock(cacheMutex);
         auto it = cache.find(key);
-        if (it != cache.end() && Mem::IsReadable(it->second, 0x30))
+        if (it != cache.end() && IsLiveObject(it->second))
             return it->second;
 
         UClass* cls = FindObjectFast(className);
@@ -904,17 +954,25 @@ namespace
             return nullptr;
 
         UClass* objectClass = object->Class();
-        if (!Mem::IsReadable(objectClass, 0x30))
+        if (!IsLiveObject(objectClass))
             return nullptr;
 
         static std::unordered_map<std::string, UFunction*> cache;
         static std::unordered_map<std::string, ULONGLONG> missLogMs;
         static std::mutex cacheMutex;
 
-        std::string key = std::to_string((uintptr_t)objectClass) + "::" + shortName;
+        // The address alone is not an identity -- IsLiveObject passes for a
+        // destroyed class whose block another live UObject now occupies -- so the
+        // key carries the class's FName too, or the new class's instances would be
+        // served the old one's UFunction. The FName is read raw, never resolved
+        // against the name pool.
+        FName* className = objectClass->NamePtr();
+        std::string key = std::to_string((uintptr_t)objectClass) + ":"
+                        + std::to_string(className->ComparisonIndex) + ":"
+                        + std::to_string(className->Number) + "::" + shortName;
         std::lock_guard<std::mutex> lock(cacheMutex);
         auto it = cache.find(key);
-        if (it != cache.end() && Mem::IsReadable(it->second, 0x30))
+        if (it != cache.end() && IsLiveObject(it->second))
             return it->second;
 
         UFunction* fn = nullptr;
@@ -1278,20 +1336,52 @@ namespace
         return true;
     }
 
+    // A subsystem pointer held across frames, pinned to the class it resolved as.
+    // These are the longest-lived pointers the menu keeps, and flying churns level
+    // streaming hard enough to destroy a world subsystem mid-session. The class
+    // pin catches what IsLiveObject alone does not: a live object of a different
+    // class occupying the recycled slot.
+    struct PinnedSubsystem
+    {
+        const char* label;
+        UObject*    object      = nullptr;
+        UObject*    objectClass = nullptr;
+
+        UObject* Live()
+        {
+            if (!object)
+                return nullptr;
+            if (IsLiveObject(object) && object->Class() == objectClass)
+                return object;
+            LOG("%s went stale (%p); re-resolving.", label, (void*)object);
+            object      = nullptr;
+            objectClass = nullptr;
+            return nullptr;
+        }
+
+        UObject* Pin(UObject* resolved)
+        {
+            if (!IsLiveObject(resolved))
+                return nullptr;
+            object      = resolved;
+            objectClass = resolved->Class();
+            return object;
+        }
+    };
+
     UObject* ResolveWorldStreamingSubsystem()
     {
-        static UObject* cached = nullptr;
+        static PinnedSubsystem cached{ "World streaming subsystem" };
         static bool loggedMissing = false;
 
-        if (Mem::IsReadable(cached, 0x30))
-            return cached;
+        if (UObject* live = cached.Live())
+            return live;
 
-        if (UObject* live = CachedObject("BP_WorldStreamingSubsystem_C_0"))
+        if (UObject* found = CachedObject("BP_WorldStreamingSubsystem_C_0"))
         {
-            cached = live;
             loggedMissing = false;
-            LOG("Resolved world streaming subsystem object -> %p", (void*)cached);
-            return cached;
+            LOG("Resolved world streaming subsystem object -> %p", (void*)found);
+            return cached.Pin(found);
         }
 
         UObject* lib = CachedObject("SubsystemUtils AtomicHeart.Default__SubsystemUtils");
@@ -1300,12 +1390,14 @@ namespace
         {
             P_ObjectReturn p{};
             lib->ProcessEvent(fn, &p);
-            cached = static_cast<UObject*>(p.ReturnValue);
-            if (cached)
+            UObject* returned = static_cast<UObject*>(p.ReturnValue);
+            // The game handed this back; it never went through FindObject, so it has
+            // had no validation at all until now.
+            if (IsLiveObject(returned))
             {
                 loggedMissing = false;
-                LOG("Resolved world streaming subsystem via SubsystemUtils -> %p", (void*)cached);
-                return cached;
+                LOG("Resolved world streaming subsystem via SubsystemUtils -> %p", (void*)returned);
+                return cached.Pin(returned);
             }
         }
 
@@ -1321,7 +1413,9 @@ namespace
     {
         UObject* lib = CachedObject("StreamingUtils AtomicHeart.Default__StreamingUtils");
         UFunction* fn = CachedFn(AH::Fn_InvalidateStreaming);
-        UObject* worldContext = context ? context : GetWorld();
+        // The caller passes its pawn here, and the game dereferences it to reach
+        // the world, so it has to be live rather than merely readable.
+        UObject* worldContext = IsLiveObject(context) ? context : GetWorld();
         if (!lib || !fn || !worldContext)
             return false;
 
@@ -1344,18 +1438,17 @@ namespace
 
     UObject* ResolveDebugSubsystem()
     {
-        static UObject* cached = nullptr;
+        static PinnedSubsystem cached{ "Debug subsystem" };
         static bool loggedMissing = false;
 
-        if (Mem::IsReadable(cached, 0x30))
-            return cached;
+        if (UObject* live = cached.Live())
+            return live;
 
-        cached = CachedObject("DebugSubsystem_0");
-        if (cached)
+        if (UObject* found = CachedObject("DebugSubsystem_0"))
         {
             loggedMissing = false;
-            LOG("Resolved debug subsystem -> %p", (void*)cached);
-            return cached;
+            LOG("Resolved debug subsystem -> %p", (void*)found);
+            return cached.Pin(found);
         }
 
         if (!loggedMissing)
@@ -12053,7 +12146,7 @@ bool Features::AiSpawnSavedCharacter(int index)
     // (instant, same session). Otherwise the path is loaded ON DEMAND on the game
     // thread (LoadClassByPath) -- so you NO LONGER need to be near the NPC to spawn it.
     SpawnRequest req; req.path = path; req.label = name;
-    if (Mem::IsReadable(cached, 0x30)) req.cls = cached;
+    if (IsLiveObject(cached)) req.cls = cached;
     EnqueueSpawn(std::move(req));
     LOG("AiSpawnSavedCharacter: queued streamed spawn of '%s'", name.c_str());
     return true;
@@ -13539,10 +13632,16 @@ int Features::GiveAllWeapons(bool equipLast)
 // Get (+cache) the AI pawn's UMercunaNavigationComponent. Game-thread only (no mutex).
 static UObject* GetMercunaNavComp(UObject* ai)
 {
-    static std::unordered_map<UObject*, UObject*> cache;
+    // Keyed by the pawn's ADDRESS, which the allocator reuses, so liveness alone
+    // would hand a new pawn the destroyed one's nav component -- both sides pass
+    // IsLiveObject in that case. Pin the class the key resolved as, the way
+    // PinnedSubsystem does, so a recycled slot reads as a miss.
+    struct NavEntry { UObject* comp; UObject* aiClass; };
+    static std::unordered_map<UObject*, NavEntry> cache;
     auto it = cache.find(ai);
-    if (it != cache.end() && Mem::IsReadable(it->second, 0x30))
-        return it->second;
+    if (it != cache.end() && IsLiveObject(ai) && IsLiveObject(it->second.comp) &&
+        ai->Class() == it->second.aiClass)
+        return it->second.comp;
     static UClass* navCls = nullptr;
     if (!Mem::IsReadable(navCls, 0x30)) navCls = FindObjectFast(AH::Cls_MercunaNavComponent);
     UFunction* fn = CachedFn(AH::Fn_ActorGetComponentsByClass);
@@ -13558,7 +13657,7 @@ static UObject* GetMercunaNavComp(UObject* ai)
             found = p.ReturnValue.Data[0];
     }
     catch (...) {}
-    if (Mem::IsReadable(found, 0x30)) { cache[ai] = found; return found; }
+    if (IsLiveObject(found) && IsLiveObject(ai)) { cache[ai] = { found, ai->Class() }; return found; }
     return nullptr;
 }
 
