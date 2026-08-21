@@ -535,7 +535,10 @@ void UE::UObject::ProcessEvent(UObject* function, void* params)
     void** vt = VTable();
     if (!Mem::IsReadable(vt, (Offsets::VFUNC_PROCESSEVENT + 1) * sizeof(void*))) return;
     void* target = vt[Offsets::VFUNC_PROCESSEVENT];
-    if (!Mem::IsReadable(target, 1)) return; // must point at executable code
+    // Executable, not merely readable: a destroyed object whose memory has been
+    // reused leaves a vtable slot that reads fine and points at data. See
+    // Mem::IsExecutable for why /EHa cannot contain the resulting fault.
+    if (!Mem::IsExecutable(target, 1)) return;
     reinterpret_cast<Fn>(target)(this, function, params);
 }
 

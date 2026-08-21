@@ -23,6 +23,16 @@ namespace Mem
     // True if [p, p+size) is committed and readable in this process.
     bool IsReadable(const void* p, size_t size = sizeof(void*));
 
+    // True if [p, p+size) is committed and carries an EXECUTE protection. Guard
+    // every indirect call into game code with this, never with IsReadable: DEP
+    // raises the execute violation after control has left our code, past where
+    // /EHa and catch(...) can contain it.
+    //
+    // Not Scanner::IsExecutableAddress, which asks the narrower "inside the game
+    // image's executable sections" and so rejects a trampoline another tool
+    // allocated outside the image while hooking the same function.
+    bool IsExecutable(const void* p, size_t size = 1);
+
     // Heuristic: looks like a usable heap/image pointer (aligned, readable,
     // not in the null page or obviously bogus high range).
     bool LooksLikePtr(const void* p);

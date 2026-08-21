@@ -645,9 +645,10 @@ namespace
             return false;
         }
         void* target = vt[Offsets::VFUNC_PROCESSEVENT];
-        if (!Mem::IsReadable(target, 1))
+        // MinHook would otherwise read the prologue out of whatever data lives there.
+        if (!Mem::IsExecutable(target, 1))
         {
-            LOG("ProcessEvent hook: target not executable");
+            LOG("ProcessEvent hook: target %p not executable", target);
             return false;
         }
 
@@ -9339,7 +9340,7 @@ namespace
         {
             if (!Mem::IsReadable(vt + i, sizeof(void*))) break;
             void* fn = vt[i];
-            if (!Mem::IsReadable(fn, 1)) break; // stop at the first non-code slot
+            if (!Mem::IsReadable(fn, 1)) break; // stop at the first unreadable slot
             if (!first) os << ",";
             first = false;
             os << "{\"index\":" << i << ",\"fn\":"; WriteCodeAddrJson(os, fn); os << "}";
