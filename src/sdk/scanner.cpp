@@ -13,6 +13,7 @@
 // (ocornut). See LICENSE and NOTICE. Forks must stay GPL-3.0-or-later and open.
 #include "scanner.h"
 #include "../core/globals.h"
+#include "../core/memory.h"
 #include <Windows.h>
 #include <cstdlib>
 #include <vector>
@@ -246,6 +247,29 @@ namespace Scanner
                 return true;
         }
         return false;
+    }
+
+    bool IsFunctionEntry(const void* address)
+    {
+        if (!IsExecutableAddress(address, 1))
+            return false;
+        DWORD64 imageBase = 0;
+        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(
+            reinterpret_cast<DWORD64>(address), &imageBase, nullptr);
+        if (!fn)
+            return false;
+        if (imageBase + fn->BeginAddress != reinterpret_cast<DWORD64>(address))
+            return false;
+
+        // Beginning at an entry does not prove it IS one: 135158 of build
+        // 24534183's 348671 RUNTIME_FUNCTIONs are a linker-split function's cold
+        // half, which begins a range of its own and chains to the primary instead
+        // of carrying unwind info. UNWIND_INFO is in no Windows header -- its first
+        // byte is Version in bits 0-2, Flags in bits 3-7.
+        const uint8_t* unwind = reinterpret_cast<const uint8_t*>(imageBase + fn->UnwindData);
+        if (!Mem::IsReadable(unwind, 1))
+            return false;
+        return ((*unwind >> 3) & UNW_FLAG_CHAININFO) == 0;
     }
 
     uint8_t* DecodeRel32CallTarget(uint8_t* call)

@@ -284,6 +284,9 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
   the out-of-bounds teleporter can be identified and disabled precisely.
 - **Debug → dump objects** - logs the first 200 `GObjects` from a background
   thread so the render hook does not block
+- **Debug → Verify member offsets** - diffs every reflected member offset in
+  `offsets.h` against the running game and names the ones a patch has moved; see
+  "After a game patch" below
 
 Runtime function names include `/Script/...`; keep the function constants in
 `offsets.h` in that format or `FindFunction()` will miss them.
@@ -307,6 +310,23 @@ stale. Rebuild, inject, and confirm the log says `ResolveGlobals: VALID`.
 The log names this case directly: injection compares the game's image size against
 the build `offsets.h` was captured from and warns when they differ.
 
+That covers the three engine globals. For the **member** offsets, open the **Debug**
+tab and press **Verify member offsets**. It reads each one off the running game via
+the engine's own reflection data and diffs it against `offsets.h`, so a patch names
+the entries it moved and the values to set them to, instead of showing up as a
+feature that quietly misbehaves:
+
+```
+VerifyOffsets: Engine.Actor   RootComponent   MOVED: offsets.h says 0x140, the game
+says 0x130 -- set O_Actor_RootComponent = 0x130
+```
+
+Only members the engine reflects can be checked this way. The native engine
+internals (the `UObject`/`UStruct` chain, the `GObjects` layout,
+`VFUNC_PROCESSEVENT`) are not `UPROPERTY`s and still need a Dumper-7 dump - they
+are also the least likely to move, since they follow the engine version rather than
+the game's own classes.
+
 ### Resolving the offsets - the path to *full* control
 1. Inject **[Dumper-7](https://github.com/Encryqed/Dumper-7)** into the game once.
    It prints the `GObjects`, `GNames`, and `ProcessEvent` addresses **and** dumps a
@@ -328,12 +348,23 @@ you can trigger from here once the SDK resolves.
 ---
 
 ## Notes & caveats
-- Cheats are applied from the **render thread** (inside the Present hook). This is
-  fine for actor functions; if a particular function must run on the game thread,
-  hook the game's tick instead (`AActor::Tick` / `UWorld::Tick` from the dump).
-- `VFUNC_PROCESSEVENT` (vtable index) and the `SIG_*`/member offsets in `offsets.h`
-  are the first things to re-check after a game patch. The three engine globals are
-  handled for you where possible - see "After a game patch" above.
+- Cheats are applied from the **render thread** (inside the Present hook). That is
+  fine for property reads and writes, and **not** fine for anything that mutates the
+  actor graph - `K2_SetActorLocation` is a full component move, not a property
+  write. Symptoms are subtle rather than loud: the camera desynchronising from the
+  character mesh for a frame, or a call like `SetMovementMode` returning having done
+  nothing. Marshal that work to the game thread with `QueueGameThread`, which drains
+  inside the `ProcessEvent` hook, the way fly, the teleports and the AI features do.
+  See CONTRIBUTING.md for the full rule.
+- Native hooks must target a **function entry**, checked with
+  `Scanner::IsFunctionEntry` - a hardcoded RVA that a patch has shifted otherwise
+  gets a MinHook jump written mid-instruction, rewriting the game's code. Injection
+  self-checks the hardcoded RVAs and logs any that have gone stale.
+- `VFUNC_PROCESSEVENT` (vtable index), the `SIG_*`/member offsets in `offsets.h`, and
+  any hardcoded native-hook RVA are the first things to re-check after a game patch.
+  The three engine globals are handled for you where possible, and **Debug → Verify
+  member offsets** checks the member layer against the running game - see "After a
+  game patch" above.
 - To ship without the debug console, change `Log::Init(true)` to `false` in
   `dllmain.cpp`.
 ```

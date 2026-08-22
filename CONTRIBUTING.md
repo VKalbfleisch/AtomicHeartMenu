@@ -49,12 +49,33 @@ This DLL must never crash the game. Follow the existing safety model:
 
 - Guard **every** game-memory dereference with `Mem::IsReadable` before you read or
   write it.
+- Guard every **indirect call** into game code with `Mem::IsExecutable`, never with
+  `Mem::IsReadable`. Readable is not executable, and a bad function pointer that
+  reads fine still DEP-faults on the call - after control has left our code, where
+  `catch(...)` can no longer reach it.
 - Wrap any risky operation (anything that calls into game code) in `try/catch`. The
   build uses `/EHa`, so `catch(...)` also traps access violations.
 - Do not run structural or heavy work on the render (Present) thread. Use the
-  worker thread or the game-thread pump, the way the existing features do.
+  worker thread or the game-thread pump, the way the existing features do. This
+  covers more than it looks: `K2_SetActorLocation` is not a property write but a
+  full component move (scene transform, physics body, overlap refresh that can fire
+  blueprint delegates, streaming and significance updates), and moving an actor from
+  the Present hook races the game thread over the same actor graph. `bSweep=true`
+  adds a blocking-hit query on top, which can call `OnComponentHit` into blueprint
+  code. It also silently breaks calls that depend on engine bookkeeping -
+  `SetMovementMode` from the render thread returns having done nothing.
+- Never detour an address that is not a **function entry**. Guard every MinHook
+  target with `Scanner::IsFunctionEntry`, not `Scanner::IsExecutableAddress`, which
+  is true of every byte in `.text` including the middle of an instruction. MinHook
+  writes its 5-byte JMP wherever it is told: an RVA that a game patch has shifted
+  lands mid-instruction and rewrites the game's own code. That is not a read of
+  garbage, it is corruption of the game, and it surfaces later as a crash in game
+  code with nothing of ours on the stack (see issue #3).
 - Re-validate cached actors immediately before each `ProcessEvent`; they can go
-  stale between frames.
+  stale between frames. Use `UE::IsLiveObject` (or `UE::IsLiveObjectNamed` when the
+  cache is keyed by name) - **not** `Mem::IsReadable`, which cannot answer this.
+  Destroying a `UObject` does not unmap its memory, so a dead object stays readable
+  and its fields return whatever now occupies the recycled block.
 - Do not reintroduce the native nav / behavior-tree calls that were deliberately
   removed for crashing.
 
@@ -64,6 +85,14 @@ This DLL must never crash the game. Follow the existing safety model:
   came from in the dumped SDK, the way the existing entries do.
 - Use the full `/Script/...` names for functions, or `FindFunctionInClass` for
   blueprint-mounted classes.
+- Prefer deriving a native hook target by **signature** (see `src/hooks/native_hooks.cpp`)
+  over hardcoding an RVA. A hardcoded RVA is correct only for the build it was read
+  from, and it fails destructively rather than quietly - see the detour rule above.
+  If you must hardcode one, add it to `kNativeHookRvas` in `features.cpp` so the
+  injection-time self-check reports it as stale after a patch.
+- After a game patch, press **Debug -> Verify member offsets** before trusting
+  anything in `Offsets::AH`. It reads each reflected member offset and each
+  ProcessEvent params-struct size off the running game and names what moved.
 
 ## Documentation
 

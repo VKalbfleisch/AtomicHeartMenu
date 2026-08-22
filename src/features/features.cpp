@@ -598,6 +598,26 @@ namespace
             // UFunction dispatch is game-thread-only in UE4) and never switch.
             unsigned long expected = 0;
             g_gameThreadId.compare_exchange_strong(expected, tid);
+            static std::atomic<bool> reported{ false };
+            if (!reported.exchange(true))
+            {
+                // The latch above assumes the first thread to reach a safe
+                // ProcessEvent callsite is the game thread, but UE also dispatches
+                // UFunctions from task-graph and async-loading workers. The thread
+                // owning the game window is the one that really is.
+                DWORD windowThread = G::hGameWindow
+                    ? GetWindowThreadProcessId(static_cast<HWND>(G::hGameWindow), nullptr) : 0;
+                unsigned long latched = g_gameThreadId.load();
+                // Absent window handle reports UNKNOWN, not MISMATCH: a false
+                // "wrong" here is worse than no line at all.
+                LOG("Game-thread pump: draining on tid=%lu, latched=%lu, window (game) thread=%lu -> %s",
+                    tid, latched, windowThread,
+                    !windowThread
+                        ? "UNKNOWN -- no game window handle yet, cannot compare"
+                        : (latched == windowThread
+                            ? "MATCH"
+                            : "MISMATCH -- tasks are draining on a worker, not the game thread"));
+            }
             if (tid == g_gameThreadId.load())
             {
                 // Drain at most a few tasks per safe callsite so a pile-up never does
@@ -645,9 +665,10 @@ namespace
             return false;
         }
         void* target = vt[Offsets::VFUNC_PROCESSEVENT];
-        if (!Mem::IsReadable(target, 1))
+        // MinHook would otherwise read the prologue out of whatever data lives there.
+        if (!Mem::IsExecutable(target, 1))
         {
-            LOG("ProcessEvent hook: target not executable");
+            LOG("ProcessEvent hook: target %p not executable", target);
             return false;
         }
 
@@ -822,16 +843,64 @@ namespace
         { "Plasmagun",  "DA_PlasmagunAmmo.DA_PlasmagunAmmo" },
     };
 
+    // Bounds how often one name can cost a full GObjects scan.
+    constexpr ULONGLONG kFnRescanThrottleMs = 5000;
+
     // Cache resolved UFunction* by full name so we only walk GObjects once.
     UFunction* CachedFn(const char* fullName)
     {
-        static std::unordered_map<std::string, UFunction*> cache;
+        // The two ways fn can be null need opposite treatment, hence everResolved.
+        // A name that has NEVER resolved is wrong for this build and retrying costs
+        // a scan forever. A name that resolved once and went stale can come back: a
+        // UFunction dies and is reborn with its class when a blueprint package
+        // unloads and reloads.
+        struct FnEntry { UFunction* fn = nullptr; bool everResolved = false; };
+
+        static std::unordered_map<std::string, FnEntry>    cache;
+        static std::unordered_map<std::string, ULONGLONG>  lastRescanMs;
         static std::mutex cacheMutex;
-        std::lock_guard<std::mutex> lock(cacheMutex);
+
+        std::unique_lock<std::mutex> lock(cacheMutex);
         auto it = cache.find(fullName);
-        if (it != cache.end()) return it->second;
+        if (it != cache.end())
+        {
+            if (it->second.fn && IsLiveObject(it->second.fn))
+                return it->second.fn;
+            if (!it->second.everResolved)
+                return nullptr;
+
+            // Stale. FindObjectFast never scans, so it is free to try every time.
+            if (UFunction* fast = FindObjectFast(fullName))
+            {
+                it->second.fn = fast;
+                LOG("Re-resolved %s -> %p (previous pointer went stale)", fullName, (void*)fast);
+                return fast;
+            }
+            it->second.fn = nullptr;
+        }
+
+        // FindFunction falls through to a full ~300k-object GObjects scan
+        // (650-900ms, measured) reached from the per-frame render tick, so it is
+        // rationed and runs with the lock RELEASED -- holding it would stall every
+        // thread wanting any cached function for the better part of a second.
+        // Stamping before the release is what makes a concurrent caller take the
+        // throttle branch rather than start a second scan of its own.
+        ULONGLONG nowMs = GetTickCount64();
+        auto rescan = lastRescanMs.find(fullName);
+        if (rescan != lastRescanMs.end() && nowMs - rescan->second < kFnRescanThrottleMs)
+            return nullptr;
+        lastRescanMs[fullName] = nowMs;
+
+        lock.unlock();
         UFunction* fn = FindFunction(fullName);
-        cache[fullName] = fn;
+        lock.lock();
+
+        // Re-look-up rather than reusing `it`: the map may have rehashed while the
+        // lock was released.
+        FnEntry& entry = cache[fullName];
+        entry.fn = fn;
+        if (fn)
+            entry.everResolved = true;
         LOG("%s %s -> %p", fn ? "Resolved" : "MISSING", fullName, (void*)fn);
         return fn;
     }
@@ -843,7 +912,9 @@ namespace
         static std::mutex cacheMutex;
         std::lock_guard<std::mutex> lock(cacheMutex);
         auto it = cache.find(name);
-        if (it != cache.end() && Mem::IsReadable(it->second, 0x30))
+        // Keyed by name, so liveness alone is not enough -- see IsLiveObjectNamed.
+        // FindObjectFast never scans, so re-resolving on a hit is cheap.
+        if (it != cache.end() && IsLiveObjectNamed(it->second, name))
             return it->second;
 
         UObject* obj = FindObjectFast(name);
@@ -874,7 +945,7 @@ namespace
         std::string key = std::string(className) + "::" + shortName;
         std::lock_guard<std::mutex> lock(cacheMutex);
         auto it = cache.find(key);
-        if (it != cache.end() && Mem::IsReadable(it->second, 0x30))
+        if (it != cache.end() && IsLiveObject(it->second))
             return it->second;
 
         UClass* cls = FindObjectFast(className);
@@ -903,17 +974,25 @@ namespace
             return nullptr;
 
         UClass* objectClass = object->Class();
-        if (!Mem::IsReadable(objectClass, 0x30))
+        if (!IsLiveObject(objectClass))
             return nullptr;
 
         static std::unordered_map<std::string, UFunction*> cache;
         static std::unordered_map<std::string, ULONGLONG> missLogMs;
         static std::mutex cacheMutex;
 
-        std::string key = std::to_string((uintptr_t)objectClass) + "::" + shortName;
+        // The address alone is not an identity -- IsLiveObject passes for a
+        // destroyed class whose block another live UObject now occupies -- so the
+        // key carries the class's FName too, or the new class's instances would be
+        // served the old one's UFunction. The FName is read raw, never resolved
+        // against the name pool.
+        FName* className = objectClass->NamePtr();
+        std::string key = std::to_string((uintptr_t)objectClass) + ":"
+                        + std::to_string(className->ComparisonIndex) + ":"
+                        + std::to_string(className->Number) + "::" + shortName;
         std::lock_guard<std::mutex> lock(cacheMutex);
         auto it = cache.find(key);
-        if (it != cache.end() && Mem::IsReadable(it->second, 0x30))
+        if (it != cache.end() && IsLiveObject(it->second))
             return it->second;
 
         UFunction* fn = nullptr;
@@ -1277,34 +1356,76 @@ namespace
         return true;
     }
 
-    UObject* ResolveWorldStreamingSubsystem()
+    // A subsystem pointer held across frames, pinned to the class it resolved as.
+    // These are the longest-lived pointers the menu keeps, and flying churns level
+    // streaming hard enough to destroy a world subsystem mid-session. The class
+    // pin catches what IsLiveObject alone does not: a live object of a different
+    // class occupying the recycled slot.
+    //
+    // Not synchronised: each instance is reached from ONE thread -- the world
+    // streaming pin from the game thread, since every RefreshFlyStreaming caller is
+    // there, and the debug pin from the render thread.
+    struct PinnedSubsystem
     {
-        static UObject* cached = nullptr;
-        static bool loggedMissing = false;
+        const char* label;
+        UObject*    object      = nullptr;
+        UObject*    objectClass = nullptr;
 
-        if (Mem::IsReadable(cached, 0x30))
-            return cached;
-
-        if (UObject* live = CachedObject("BP_WorldStreamingSubsystem_C_0"))
+        UObject* Live()
         {
-            cached = live;
-            loggedMissing = false;
-            LOG("Resolved world streaming subsystem object -> %p", (void*)cached);
-            return cached;
+            if (!object)
+                return nullptr;
+            if (IsLiveObject(object) && object->Class() == objectClass)
+                return object;
+            LOG("%s went stale (%p); re-resolving.", label, (void*)object);
+            object      = nullptr;
+            objectClass = nullptr;
+            return nullptr;
         }
 
-        UObject* lib = CachedObject("SubsystemUtils AtomicHeart.Default__SubsystemUtils");
+        UObject* Pin(UObject* resolved)
+        {
+            if (!IsLiveObject(resolved))
+                return nullptr;
+            object      = resolved;
+            objectClass = resolved->Class();
+            return object;
+        }
+    };
+
+    UObject* ResolveWorldStreamingSubsystem()
+    {
+        static PinnedSubsystem cached{ "World streaming subsystem" };
+        static bool loggedMissing = false;
+
+        if (UObject* live = cached.Live())
+            return live;
+
+        if (UObject* found = CachedObject("BP_WorldStreamingSubsystem_C_0"))
+        {
+            loggedMissing = false;
+            LOG("Resolved world streaming subsystem object -> %p", (void*)found);
+            return cached.Pin(found);
+        }
+
+        // Needles are substrings of GetFullName(), which is "<Class>
+        // <Package>.<Name>" with the package spelled in full, the same shape the
+        // Fn_* constants use. Drop the "/Script/" and the needle never matches and
+        // the lookup returns null forever, in silence.
+        UObject* lib = CachedObject("SubsystemUtils /Script/AtomicHeart.Default__SubsystemUtils");
         UFunction* fn = CachedFn(AH::Fn_GetAHWorldStreamingSubsystem);
         if (lib && fn)
         {
             P_ObjectReturn p{};
             lib->ProcessEvent(fn, &p);
-            cached = static_cast<UObject*>(p.ReturnValue);
-            if (cached)
+            UObject* returned = static_cast<UObject*>(p.ReturnValue);
+            // The game handed this back; it never went through FindObject, so it has
+            // had no validation at all until now.
+            if (IsLiveObject(returned))
             {
                 loggedMissing = false;
-                LOG("Resolved world streaming subsystem via SubsystemUtils -> %p", (void*)cached);
-                return cached;
+                LOG("Resolved world streaming subsystem via SubsystemUtils -> %p", (void*)returned);
+                return cached.Pin(returned);
             }
         }
 
@@ -1318,9 +1439,11 @@ namespace
 
     bool InvalidateStreaming(UObject* context)
     {
-        UObject* lib = CachedObject("StreamingUtils AtomicHeart.Default__StreamingUtils");
+        UObject* lib = CachedObject("StreamingUtils /Script/AtomicHeart.Default__StreamingUtils");
         UFunction* fn = CachedFn(AH::Fn_InvalidateStreaming);
-        UObject* worldContext = context ? context : GetWorld();
+        // The caller passes its pawn here, and the game dereferences it to reach
+        // the world, so it has to be live rather than merely readable.
+        UObject* worldContext = IsLiveObject(context) ? context : GetWorld();
         if (!lib || !fn || !worldContext)
             return false;
 
@@ -1343,18 +1466,17 @@ namespace
 
     UObject* ResolveDebugSubsystem()
     {
-        static UObject* cached = nullptr;
+        static PinnedSubsystem cached{ "Debug subsystem" };
         static bool loggedMissing = false;
 
-        if (Mem::IsReadable(cached, 0x30))
-            return cached;
+        if (UObject* live = cached.Live())
+            return live;
 
-        cached = CachedObject("DebugSubsystem_0");
-        if (cached)
+        if (UObject* found = CachedObject("DebugSubsystem_0"))
         {
             loggedMissing = false;
-            LOG("Resolved debug subsystem -> %p", (void*)cached);
-            return cached;
+            LOG("Resolved debug subsystem -> %p", (void*)found);
+            return cached.Pin(found);
         }
 
         if (!loggedMissing)
@@ -3337,11 +3459,18 @@ namespace
             target = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(G::moduleBase) + 0x1B93A50);
             g_fnHookTryFightStagingNative.store(target, std::memory_order_relaxed);
         }
-        if (!target || !Scanner::IsExecutableAddress(target, 8))
+        // RVA 0x1B93A50 is hardcoded from a Ghidra session on an OLDER build. On
+        // buildid 24534183 it lands two bytes inside a five-byte `call rel32` at
+        // RVA 0x1B93A4E, so an IsExecutableAddress guard would let MinHook rewrite
+        // that call's displacement.
+        if (!target || !Scanner::IsFunctionEntry(target))
         {
             bool already = g_hookTwinFightStagingHookAttempted.exchange(true, std::memory_order_relaxed);
             if (!already)
-                LOG_HOOK("TryActivateFightStagingAbility native hook unavailable target=%p moduleBase=%p", target, (void*)G::moduleBase);
+                LOG_HOOK("TryActivateFightStagingAbility native hook REFUSED: target=%p is not a "
+                         "function entry on this build (hardcoded RVA 0x1B93A50 is stale). "
+                         "Not hooking -- detouring mid-instruction corrupts the game's code. "
+                         "moduleBase=%p", target, (void*)G::moduleBase);
             return false;
         }
 
@@ -3382,8 +3511,17 @@ namespace
 
         void* target = reinterpret_cast<void*>(
             reinterpret_cast<uintptr_t>(G::moduleBase) + 0x1CA06E0);
-        if (!Scanner::IsExecutableAddress(target, 8))
+        // Stale on buildid 24534183 as well, 0x32 bytes into the function at
+        // 0x1CA06AE -- on an instruction boundary rather than mid-instruction like
+        // the selector above, but still not an entry, so still refused.
+        if (!Scanner::IsFunctionEntry(target))
+        {
+            static std::atomic<bool> logged{ false };
+            if (!logged.exchange(true))
+                LOG_HOOK("ActionContainerFactory native hook REFUSED: target=%p is not a function "
+                         "entry on this build (hardcoded RVA 0x1CA06E0 is stale).", target);
             return false;
+        }
 
         MH_STATUS status = MH_CreateHook(target,
             reinterpret_cast<void*>(&hkActionContainerFactory),
@@ -8688,11 +8826,151 @@ namespace
         FVector next = Add(currentLoc, Scale(input, flySpeed * dt));
         if (SetActorLocation(pawn, next, false))
         {
-            g_lastLoc = next;
+            // Deliberately not writing g_lastLoc: the render tick rewrites it from
+            // the pawn every frame while fly is on and the coordinate HUD reads it
+            // there, so writing here only puts a non-atomic FVector across threads.
             RefreshFlyStreaming(pawn, false);
             return true;
         }
         return false;
+    }
+
+    // Fly runs from the DX12 Present hook = the RENDER thread, but the work it
+    // does is not render-thread-safe.
+    //
+    // K2_SetActorLocation is not a property write. It is a full component move:
+    // scene-component transform, physics body, overlap refresh that can fire
+    // BeginOverlap delegates into arbitrary blueprint code, and streaming /
+    // significance updates. Run from Present it races the game thread's own tick
+    // over the same actor graph, and the corruption surfaced on a game worker
+    // thread deep inside AI code with no frame of ours on the stack.
+    std::atomic<bool>      g_flyStepPending{ false };
+    std::atomic<float>     g_flyPendingDt{ 0.0f };  // held-input seconds not yet applied
+    std::atomic<ULONGLONG> g_flyStepQueuedMs{ 0 };
+
+    // Only the queued task clears g_flyStepPending, so a pump that stops draining
+    // would otherwise wedge fly for the rest of the session and say nothing.
+    constexpr ULONGLONG kFlyStepStuckMs = 1000;
+
+    void EnterFlyingMovementMode(UObject* pawn, uint8_t* mv); // defined below
+
+    // True while any fly movement key is held. Sampled on the render thread;
+    // GetAsyncKeyState is process-wide, so it is valid from either thread.
+    bool FlyInputHeld()
+    {
+        return KeyDown('W') || KeyDown('S') || KeyDown('A') || KeyDown('D') ||
+               KeyDown(VK_SPACE) || KeyDown(VK_SHIFT);
+    }
+
+    void ScheduleFlyStep(UObject* pawn, float dt)
+    {
+        // Idle means idle -- do not drop this check. Scheduling unconditionally
+        // dispatches GetControlRotation and SetMovementMode every frame while
+        // standing still, which fired the crash in ~5s with no input where idle
+        // fly had survived 90s.
+        if (!FlyInputHeld())
+            return;
+
+        // The pump IS the ProcessEvent hook; without it there is no game thread to
+        // borrow. Skip the step rather than move the pawn from here.
+        if (!InstallProcessEventHook())
+            return;
+
+        // Bank the elapsed time BEFORE the in-flight check below. A frame dropped
+        // there still happened, so discarding its dt would make fly speed track
+        // the drain rate instead of wall-clock time -- roughly halving it, since
+        // the render thread schedules faster than the pump drains.
+        for (float banked = g_flyPendingDt.load(std::memory_order_relaxed);
+             !g_flyPendingDt.compare_exchange_weak(banked, banked + dt,
+                                                   std::memory_order_relaxed); )
+        {
+        }
+
+        // One step in flight at a time: the render thread runs ahead of the drain,
+        // so without this the queue grows without bound and fly replays stale
+        // movement.
+        ULONGLONG nowMs = GetTickCount64();
+        if (g_flyStepPending.exchange(true))
+        {
+            ULONGLONG waitedMs = nowMs - g_flyStepQueuedMs.load(std::memory_order_relaxed);
+            if (waitedMs < kFlyStepStuckMs)
+                return;
+            LOG("Fly: the queued step has not drained in %llums -- the game-thread pump "
+                "looks stalled. Re-queuing.", waitedMs);
+        }
+        g_flyStepQueuedMs.store(nowMs, std::memory_order_relaxed);
+
+        QueueGameThread([pawn]()
+        {
+            // Consume unconditionally: an abandoned step must not leave its time
+            // banked for the next one to apply as a lurch.
+            float step = ClampDeltaSeconds(g_flyPendingDt.exchange(0.0f, std::memory_order_relaxed));
+            try
+            {
+                // Re-validate on arrival: this runs a frame or so after it was
+                // queued, and the pawn can die in between.
+                if (IsLiveObject(pawn))
+                {
+                    uint8_t* mv = nullptr;
+                    if (Mem::IsReadable(reinterpret_cast<uint8_t*>(pawn) + AH::Char_CharacterMovement, 8))
+                        mv = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(pawn) + AH::Char_CharacterMovement);
+                    if (mv)
+                        EnterFlyingMovementMode(pawn, mv);
+
+                    // Read the location here rather than trusting the render
+                    // thread's copy, which is a frame stale by now.
+                    FVector loc{};
+                    if (ReadActorLocationFast(pawn, loc))
+                        ApplyMinecraftFly(pawn, loc, step);
+                }
+            }
+            catch (...) {}
+            g_flyStepPending.store(false);
+        });
+    }
+
+    // RefreshFlyStreaming dispatches InvalidateStreaming and EnableLevelStreaming,
+    // so it is game-thread work; the enable / disable edges reach it from the
+    // render tick.
+    void ScheduleFlyStreamingRefresh(UObject* pawn)
+    {
+        if (!InstallProcessEventHook())
+            return;
+        QueueGameThread([pawn]()
+        {
+            try { if (IsLiveObject(pawn)) RefreshFlyStreaming(pawn, true); }
+            catch (...) {}
+        });
+    }
+
+    // Every user-facing teleport. Beyond the component move fly already does, these
+    // sweep: the blocking-hit query can fire OnComponentHit and BeginOverlap into
+    // blueprint code. The pawn is resolved on the game thread rather than captured
+    // here, so a death between the click and the drain cannot move a dead pawn.
+    void QueueTeleport(FVector dest, bool refreshStreaming, const char* what)
+    {
+        std::string label = what ? what : "Teleport";
+        if (!InstallProcessEventHook())
+        {
+            LOG("%s skipped: no game-thread pump (ProcessEvent hook unavailable).", label.c_str());
+            return;
+        }
+        QueueGameThread([dest, refreshStreaming, label]()
+        {
+            try
+            {
+                UObject* pawn = GetLocalPawn();
+                if (!SetActorLocation(pawn, dest, true))
+                {
+                    LOG("%s failed: pawn=%p", label.c_str(), (void*)pawn);
+                    return;
+                }
+                if (refreshStreaming)
+                    RefreshFlyStreaming(pawn, true);
+                LOG("%s %.1f %.1f %.1f", label.c_str(), dest.X, dest.Y, dest.Z);
+            }
+            catch (...) { LOG("%s: exception (ignored)", label.c_str()); }
+        });
     }
 
     bool InvokeTakeWeapon(UObject* pawn, UObject* asset)
@@ -8892,16 +9170,127 @@ namespace
         g_movementBackup.walkValid = false;
     }
 
+    // Going through the engine is what runs OnMovementModeChanged. Entering
+    // MOVE_Walking is where it does FindFloor, AdjustFloorHeight and
+    // SetBaseFromFloor and zeroes Velocity.Z. Game thread only -- dispatches a
+    // UFunction.
+    bool SetMovementModeViaEngine(uint8_t* mv, uint8_t mode)
+    {
+        UObject* movementObject = reinterpret_cast<UObject*>(mv);
+        UFunction* fn = CachedObjectClassFn(movementObject, "SetMovementMode");
+        if (!fn)
+            return false;
+        P_SetMovementMode p{ mode, 0 };
+        movementObject->ProcessEvent(fn, &p);
+        return true;
+    }
+
+    // The exit half of EnterFlyingMovementMode, reached from the render tick's
+    // disable edge, hence the queue. Milder than the entry direction: PhysWalking
+    // re-runs FindFloor by itself on the next tick.
+    void ScheduleLeaveFlyingMovementMode(uint8_t* mv, uint8_t mode)
+    {
+        if (!mv)
+            return;
+        if (!InstallProcessEventHook())
+        {
+            if (WriteUInt8Field(mv, AH::Move_MovementMode, mode))
+                LOG("Fly restored: MovementMode=%u by raw write (no game-thread pump); "
+                    "the floor and movement base are NOT re-found on this path.", (unsigned)mode);
+            return;
+        }
+        QueueGameThread([mv, mode]()
+        {
+            try
+            {
+                if (!IsLiveObject(reinterpret_cast<UObject*>(mv)) ||
+                    !Mem::IsReadable(mv + AH::Move_MovementMode, 1))
+                    return;
+                bool viaEngine = SetMovementModeViaEngine(mv, mode);
+                uint8_t& live = *reinterpret_cast<uint8_t*>(mv + AH::Move_MovementMode);
+                bool forced = live != mode;
+                if (forced)
+                    live = mode;
+                LOG("Fly restored: MovementMode=%u via %s", (unsigned)mode,
+                    viaEngine && !forced ? "SetMovementMode" : "raw write");
+            }
+            catch (...) {}
+        });
+    }
+
     void RestoreMovementFly()
     {
         if (g_movementBackup.flyValid && WriteFloatField(g_movementBackup.mv, AH::Move_MaxFlySpeed, g_movementBackup.flySpeed))
             LOG("Fly restored: MaxFlySpeed=%.1f", g_movementBackup.flySpeed);
-        if (g_movementBackup.modeValid && WriteUInt8Field(g_movementBackup.mv, AH::Move_MovementMode, g_movementBackup.mode))
-            LOG("Fly restored: MovementMode=%u", (unsigned)g_movementBackup.mode);
+        if (g_movementBackup.modeValid)
+            ScheduleLeaveFlyingMovementMode(g_movementBackup.mv, g_movementBackup.mode);
         g_movementBackup.flyValid = false;
         g_movementBackup.modeValid = false;
         if (!g_movementBackup.walkValid)
             g_movementBackup = {};
+    }
+
+    // The character's movement base -- the component it is standing on -- read by
+    // reflection so no new build-specific offset is introduced.
+    // ACharacter::BasedMovement is an FBasedMovementInfo whose MovementBase is a
+    // UPrimitiveComponent*.
+    UObject* ReadMovementBase(UObject* pawn)
+    {
+        if (!IsLiveObject(pawn))
+            return nullptr;
+        int basedOff = Reflect::FindPropertyOffset(pawn, "BasedMovement");
+        if (basedOff < 0)
+            return nullptr;
+        // Retried rather than latched: fly is usually enabled while the background
+        // short-name index is still building, so a one-shot lookup loses the
+        // movement-base log below for the session. FindObjectFast never scans.
+        static int baseOff = -1;
+        if (baseOff < 0)
+        {
+            UObject* info = FindObjectFast("Engine.BasedMovementInfo");
+            if (IsLiveObject(info))
+                baseOff = Reflect::FindPropertyOffsetInStruct(info, "MovementBase");
+        }
+        if (baseOff < 0)
+            return nullptr;
+        uint8_t* addr = reinterpret_cast<uint8_t*>(pawn) + basedOff + baseOff;
+        if (!Mem::IsReadable(addr, sizeof(void*)))
+            return nullptr;
+        return *reinterpret_cast<UObject**>(addr);
+    }
+
+    // A raw byte write to UCharacterMovementComponent::MovementMode sets the field
+    // but skips SetMovementMode -> OnMovementModeChanged, where leaving
+    // MOVE_Walking does CurrentFloor.Clear() and SetBase(NULL). The character then
+    // still references the component it was standing on; fly away, let that
+    // component's level stream out, and the game walks the dangling pointer on the
+    // next jump -- its own call, through its own stale pointer, uncatchable by us.
+    void EnterFlyingMovementMode(UObject* pawn, uint8_t* mv)
+    {
+        if (!Mem::IsReadable(mv + AH::Move_MovementMode, 1))
+            return;
+        uint8_t& mode = *reinterpret_cast<uint8_t*>(mv + AH::Move_MovementMode);
+        if (mode == AH::MOVE_Flying)
+            return; // steady state: no per-frame ProcessEvent
+
+        UObject* baseBefore = ReadMovementBase(pawn);
+
+        bool viaEngine = SetMovementModeViaEngine(mv, AH::MOVE_Flying);
+        // Fallback so fly still works if SetMovementMode cannot be resolved. It
+        // carries the dangling-base hazard above, so the log says so.
+        if (mode != AH::MOVE_Flying)
+        {
+            mode = AH::MOVE_Flying;
+            if (!viaEngine)
+                LOG("Fly: SetMovementMode unavailable; forced MovementMode=Flying by raw write. "
+                    "The stale movement base is NOT cleared on this path -- jumping may crash the game.");
+        }
+
+        UObject* baseAfter = ReadMovementBase(pawn);
+        LOG("Fly: entered MOVE_Flying via %s; movement base %p -> %p%s",
+            viaEngine ? "SetMovementMode" : "raw write",
+            (void*)baseBefore, (void*)baseAfter,
+            baseBefore && !baseAfter ? " (stale base cleared)" : "");
     }
 
     bool ApplyInventoryIgnoreOverWeight(UObject* inventory, bool ignore)
@@ -9339,7 +9728,7 @@ namespace
         {
             if (!Mem::IsReadable(vt + i, sizeof(void*))) break;
             void* fn = vt[i];
-            if (!Mem::IsReadable(fn, 1)) break; // stop at the first non-code slot
+            if (!Mem::IsReadable(fn, 1)) break; // stop at the first unreadable slot
             if (!first) os << ",";
             first = false;
             os << "{\"index\":" << i << ",\"fn\":"; WriteCodeAddrJson(os, fn); os << "}";
@@ -12052,7 +12441,7 @@ bool Features::AiSpawnSavedCharacter(int index)
     // (instant, same session). Otherwise the path is loaded ON DEMAND on the game
     // thread (LoadClassByPath) -- so you NO LONGER need to be near the NPC to spawn it.
     SpawnRequest req; req.path = path; req.label = name;
-    if (Mem::IsReadable(cached, 0x30)) req.cls = cached;
+    if (IsLiveObject(cached)) req.cls = cached;
     EnqueueSpawn(std::move(req));
     LOG("AiSpawnSavedCharacter: queued streamed spawn of '%s'", name.c_str());
     return true;
@@ -13010,6 +13399,322 @@ int Features::AiZoneSnapshotCount()
     return (int)g_zoneSnapshot.size();
 }
 
+// =======================================================================
+//  MEMBER-OFFSET VERIFICATION  --  read the live game instead of a dump
+// =======================================================================
+//  The member-layer counterpart to tools/find_globals.py, needing no external
+//  tool: every UPROPERTY carries its own byte offset in the engine's reflection
+//  data, so a class's ChildProperties list answers "where does RootComponent
+//  live on THIS build" directly.
+//
+//  Reflected members only. The UObject/UStruct/FField chain, the GObjects array
+//  layout and VFUNC_PROCESSEVENT are not UPROPERTYs and still need a Dumper-7
+//  dump.
+//
+//  Read-only reflection, no ProcessEvent, so a worker thread cannot freeze the
+//  game thread.
+namespace
+{
+    struct OffsetCheck
+    {
+        const char* className;   // FindObjectFast needle, "Package.Class"
+        const char* propName;    // the UPROPERTY name as the engine reports it
+        int         expected;    // what offsets.h says today
+        const char* constant;    // its name, so the log names what to edit
+    };
+
+    // Every member offset that reflection can reach. Engine-layer names are stock
+    // UE4 and should always resolve; an AtomicHeart name that does not resolve is
+    // reported as unresolved rather than as a mismatch, because a wrong guess at
+    // the property name proves nothing about the offset.
+    constexpr OffsetCheck kOffsetChecks[] =
+    {
+        // ---- Engine layer ----
+        { "Engine.Actor",                     "RootComponent",        Offsets::O_Actor_RootComponent,      "O_Actor_RootComponent" },
+        { "Engine.Actor",                     "CustomTimeDilation",   Offsets::O_Actor_CustomTimeDilation, "O_Actor_CustomTimeDilation" },
+        { "Engine.SceneComponent",            "RelativeLocation",     Offsets::O_Scene_RelativeLocation,   "O_Scene_RelativeLocation" },
+        { "Engine.World",                     "OwningGameInstance",   Offsets::O_World_GameInstance,       "O_World_GameInstance" },
+        { "Engine.World",                     "PersistentLevel",      Offsets::O_World_PersistentLevel,    "O_World_PersistentLevel" },
+        { "Engine.World",                     "Levels",               Offsets::O_World_Levels,             "O_World_Levels" },
+        { "Engine.Level",                     "Actors",               Offsets::O_Level_Actors,             "O_Level_Actors" },
+        { "Engine.GameInstance",              "LocalPlayers",         Offsets::O_GameInst_LocalPlayers,    "O_GameInst_LocalPlayers" },
+        { "Engine.Player",                    "PlayerController",     Offsets::O_Player_PlayerController,  "O_Player_PlayerController" },
+        { "Engine.PlayerController",          "AcknowledgedPawn",     Offsets::O_Controller_Pawn,          "O_Controller_Pawn" },
+        { "Engine.PlayerController",          "PlayerCameraManager",  Offsets::O_PC_CameraManager,         "O_PC_CameraManager" },
+        { "Engine.Controller",                "Pawn",                 Offsets::O_BaseController_Pawn,      "O_BaseController_Pawn" },
+        { "Engine.Pawn",                      "Controller",           Offsets::O_Pawn_Controller,          "O_Pawn_Controller" },
+        { "Engine.CameraComponent",           "FieldOfView",          AH::Camera_FieldOfView,              "AH::Camera_FieldOfView" },
+        { "Engine.Character",                 "CharacterMovement",    AH::Char_CharacterMovement,          "AH::Char_CharacterMovement" },
+        { "Engine.MovementComponent",         "Velocity",             AH::Move_Velocity,                   "AH::Move_Velocity" },
+        { "Engine.CharacterMovementComponent","GravityScale",         AH::Move_GravityScale,               "AH::Move_GravityScale" },
+        { "Engine.CharacterMovementComponent","JumpZVelocity",        AH::Move_JumpZVelocity,              "AH::Move_JumpZVelocity" },
+        { "Engine.CharacterMovementComponent","MovementMode",         AH::Move_MovementMode,               "AH::Move_MovementMode" },
+        { "Engine.CharacterMovementComponent","MaxWalkSpeed",         AH::Move_MaxWalkSpeed,               "AH::Move_MaxWalkSpeed" },
+        { "Engine.CharacterMovementComponent","MaxFlySpeed",          AH::Move_MaxFlySpeed,                "AH::Move_MaxFlySpeed" },
+        { "Engine.CharacterMovementComponent","AirControl",           AH::Move_AirControl,                 "AH::Move_AirControl" },
+
+        // ---- AtomicHeart layer ----
+        { "AtomicHeart.AHBaseCharacter",      "FPCamera",             AH::Char_FPCamera,                   "AH::Char_FPCamera" },
+        { "AtomicHeart.AHBaseCharacter",      "TPCamera",             AH::Char_TPCamera,                   "AH::Char_TPCamera" },
+        { "AtomicHeart.AHPlayerCharacter",    "InventoryPlayer",      AH::Char_InventoryPlayer,            "AH::Char_InventoryPlayer" },
+        { "AtomicHeart.EquipableItem",        "Mesh",                 AH::Weapon_Mesh,                     "AH::Weapon_Mesh" },
+        { "AtomicHeart.EquipableItem",        "ItemDataAsset",        AH::Weapon_ItemDataAsset,            "AH::Weapon_ItemDataAsset" },
+        { "EasyBallistics.EBBarrel",          "Ammo",                 AH::EBBarrel_Ammo,                   "AH::EBBarrel_Ammo" },
+        { "AtomicHeart.AIMixedNavigationCharacter", "Mercuna3DMovement", AH::Mixed_Mercuna3DMovement,      "AH::Mixed_Mercuna3DMovement" },
+        { "AtomicHeart.AIMixedNavigationCharacter", "MercunaNavigation", AH::Mixed_MercunaNavigation,      "AH::Mixed_MercunaNavigation" },
+    };
+
+    volatile LONG g_offsetVerifyRunning = 0;
+
+    // ---- hardcoded native-hook RVAs ---------------------------------------
+    //
+    // Raw addresses copied from Ghidra sessions on whatever build was current at
+    // the time. Unlike a wrong member offset, a stale one here does not read
+    // garbage, it WRITES -- see Scanner::IsFunctionEntry, and issue #3.
+    //
+    // IsFunctionEntry makes each install fail closed, but silently, leaving
+    // someone to discover why a feature stopped working. Reporting at injection
+    // names a patched build up front, the way the image-size check does.
+    //
+    // Both are stale on buildid 24534183.
+    struct NativeHookRva
+    {
+        uintptr_t   rva;
+        const char* what;
+    };
+
+    constexpr NativeHookRva kNativeHookRvas[] =
+    {
+        { 0x1B93A50, "Hook Twin fight-staging selector" },
+        { 0x1CA06E0, "Hook Twin action-container factory" },
+    };
+
+    void LogNativeHookRvaSelfCheck()
+    {
+        if (!G::moduleBase)
+            return;
+        int stale = 0;
+        for (const NativeHookRva& entry : kNativeHookRvas)
+        {
+            void* target = reinterpret_cast<void*>(
+                reinterpret_cast<uintptr_t>(G::moduleBase) + entry.rva);
+            if (Scanner::IsFunctionEntry(target))
+                continue;
+            ++stale;
+            LOG_HOOK("RVA self-check: 0x%llX (%s) is NOT a function entry on this build -- "
+                     "STALE. The detour will be refused; the feature is off until the address "
+                     "is re-derived.",
+                     (unsigned long long)entry.rva, entry.what);
+        }
+        if (!stale)
+            LOG_HOOK("RVA self-check: all %d hardcoded native-hook RVAs are function entries.",
+                     (int)(sizeof(kNativeHookRvas) / sizeof(kNativeHookRvas[0])));
+    }
+
+    // ---- ProcessEvent params-struct sizes ---------------------------------
+    //
+    // Every P_* struct below is a STACK BUFFER that ProcessEvent hands to game
+    // code, which writes its out-params and return value straight into it. The
+    // sizes are hardcoded from a Dumper-7 dump of a DIFFERENT build (18319896),
+    // and static_assert only proves our struct is the size we said -- not that
+    // the size is right for the game now running.
+    //
+    // An undersized struct is not a wrong value, it is memory corruption: the
+    // game writes past the end of a local, smashing the caller's frame.
+    //
+    // NATIVE UFunctions only. PropertiesSize is params plus script locals; a
+    // native has no locals, so it equals the params block, but a blueprint
+    // function's does not and would be reported UNDERSIZED here for no reason.
+    // offsets.h carries no O_UFunction_ParmsSize to compare against instead.
+    struct ParamsCheck
+    {
+        const char* funcName;    // /Script/... full name, as passed to CachedFn
+        int         ourSize;     // sizeof(the P_* struct we pass)
+        const char* structName;
+    };
+
+    const ParamsCheck kParamsChecks[] =
+    {
+        // Fly / noclip path -- the one issue #3 ran through.
+        { AH::Fn_SetActorLocation,        (int)sizeof(P_SetActorLocation),  "P_SetActorLocation" },
+        { AH::Fn_GetActorLocation,        (int)sizeof(P_GetActorLocation),  "P_GetActorLocation" },
+        { AH::Fn_GetControlRotation,      (int)sizeof(P_GetControlRotation),"P_GetControlRotation" },
+        { AH::Fn_SetActorEnableCollision, (int)sizeof(P_BoolParam),         "P_BoolParam" },
+        { AH::Fn_SetActorScale3D,         (int)sizeof(FVector),             "FVector (SetActorScale3D)" },
+        { AH::Fn_SetMovementMode,         (int)sizeof(P_SetMovementMode),   "P_SetMovementMode" },
+        // Streaming assist.
+        { AH::Fn_InvalidateStreaming,     (int)sizeof(P_WorldContext),      "P_WorldContext" },
+        { AH::Fn_EnableLevelStreaming,    (int)sizeof(P_BoolParam),         "P_BoolParam" },
+        { AH::Fn_GetAHWorldStreamingSubsystem, (int)sizeof(P_ObjectReturn), "P_ObjectReturn" },
+    };
+
+    // The table entries are NEEDLES: FindObjectFast matches them as substrings
+    // among the objects sharing the last name token, so "Engine.Level" would also
+    // accept any object named Level whose path contains it. Walking UStruct fields
+    // off one of those is guarded and will not fault, but it can follow unrelated
+    // pointers to a plausible-looking number -- and this tool's output is a
+    // constant the user is told to paste into offsets.h.
+    //
+    // Every UStruct's own class is either a *Class metaclass (Class,
+    // BlueprintGeneratedClass, DynamicClass, ...) or ScriptStruct, so one string
+    // compare bootstraps with no extra lookup.
+    bool IsStructLike(UObject* object)
+    {
+        if (!IsLiveObject(object))
+            return false;
+        std::string meta;
+        try { meta = object->Class()->GetName(); } catch (...) { return false; }
+        if (meta == "ScriptStruct")
+            return true;
+        return meta.size() >= 5 && meta.compare(meta.size() - 5, 5, "Class") == 0;
+    }
+
+    DWORD WINAPI VerifyOffsetsThread(LPVOID)
+    {
+        int matched = 0, moved = 0, unresolvedProp = 0, unresolvedClass = 0;
+        try
+        {
+            // Class lookups go through the background short-name index. Kick it off
+            // here so a run started seconds after injection warms it rather than
+            // reporting every class as unresolved.
+            UE::StartObjectNameIndex();
+            LOG("VerifyOffsets: checking %d reflected member offsets against offsets.h",
+                (int)(sizeof(kOffsetChecks) / sizeof(kOffsetChecks[0])));
+
+            const char* lastClassName = nullptr;
+            UClass*     lastClass     = nullptr;
+            for (const OffsetCheck& check : kOffsetChecks)
+            {
+                // The table is grouped by class, so one lookup usually covers a run.
+                if (lastClassName != check.className)
+                {
+                    lastClassName = check.className;
+                    lastClass     = FindObjectFast(check.className);
+                }
+                if (!IsStructLike(lastClass))
+                {
+                    ++unresolvedClass;
+                    if (IsLiveObject(lastClass))
+                    {
+                        // Resolved to something, but not to a class.
+                        std::string wrong;
+                        try { wrong = lastClass->GetFullName(); } catch (...) {}
+                        LOG("VerifyOffsets: %-28s resolved to a non-class object (%s) -- "
+                            "%s not checked, and the needle needs tightening",
+                            check.className, wrong.c_str(), check.constant);
+                    }
+                    else
+                    {
+                        LOG("VerifyOffsets: %-28s class not resolved (%s not checked)",
+                            check.className, check.constant);
+                    }
+                    continue;
+                }
+
+                int actual = Reflect::FindPropertyOffsetInStruct(lastClass, check.propName);
+                if (actual < 0)
+                {
+                    ++unresolvedProp;
+                    LOG("VerifyOffsets: %-28s %-22s NOT REFLECTED -- the property name is wrong "
+                        "for this build, so %s is unverified (not necessarily wrong)",
+                        check.className, check.propName, check.constant);
+                }
+                else if (actual == check.expected)
+                {
+                    ++matched;
+                    LOG("VerifyOffsets: %-28s %-22s ok 0x%X (%s)",
+                        check.className, check.propName, actual, check.constant);
+                }
+                else
+                {
+                    ++moved;
+                    LOG("VerifyOffsets: %-28s %-22s MOVED: offsets.h says 0x%X, the game says 0x%X "
+                        "-- set %s = 0x%X",
+                        check.className, check.propName, check.expected, actual,
+                        check.constant, actual);
+                }
+            }
+        }
+        catch (...) { LOG("VerifyOffsets: exception (ignored)"); }
+
+        // ---- params-struct sizes -------------------------------------------
+        int paramsOk = 0, paramsBad = 0, paramsUnresolved = 0;
+        try
+        {
+            LOG("VerifyParams: checking %d ProcessEvent params-struct sizes against UFunction::PropertiesSize",
+                (int)(sizeof(kParamsChecks) / sizeof(kParamsChecks[0])));
+            for (const ParamsCheck& check : kParamsChecks)
+            {
+                UFunction* fn = FindObjectFast(check.funcName);
+                if (!IsLiveObject(fn) ||
+                    !Mem::IsReadable((uint8_t*)fn + Offsets::O_UStruct_PropertiesSize, 4))
+                {
+                    ++paramsUnresolved;
+                    LOG("VerifyParams: %-56s function not resolved (%s unchecked)",
+                        check.funcName, check.structName);
+                    continue;
+                }
+                int gameSize = *reinterpret_cast<int32_t*>((uint8_t*)fn + Offsets::O_UStruct_PropertiesSize);
+                if (gameSize == check.ourSize)
+                {
+                    ++paramsOk;
+                    LOG("VerifyParams: %-34s ok 0x%X (%s)",
+                        check.structName, gameSize, check.funcName);
+                }
+                else
+                {
+                    ++paramsBad;
+                    LOG("VerifyParams: %-34s %s -- ours is 0x%X, the game's params block is 0x%X (%s)%s",
+                        check.structName,
+                        check.ourSize < gameSize ? "UNDERSIZED -- STACK CORRUPTION" : "oversized (wasteful, not unsafe)",
+                        check.ourSize, gameSize, check.funcName,
+                        check.ourSize < gameSize
+                            ? " <<< the game writes past the end of our buffer on every call"
+                            : "");
+                }
+            }
+        }
+        catch (...) { LOG("VerifyParams: exception (ignored)"); }
+
+        if (paramsBad)
+            LOG("VerifyParams: DONE -- %d ok, %d MISMATCHED, %d unresolved. A mismatch where ours "
+                "is smaller corrupts the stack on every call to that function.",
+                paramsOk, paramsBad, paramsUnresolved);
+        else
+            LOG("VerifyParams: DONE -- %d ok, 0 mismatched, %d unresolved.", paramsOk, paramsUnresolved);
+
+        if (moved == 0 && unresolvedProp == 0 && unresolvedClass == 0)
+            LOG("VerifyOffsets: DONE -- all %d reflected offsets match this build.", matched);
+        else
+            LOG("VerifyOffsets: DONE -- %d ok, %d MOVED, %d property name unresolved, "
+                "%d class unresolved. Only the MOVED ones need an offsets.h edit; an "
+                "unresolved class usually means the background name index was still "
+                "building, so run it again in a few seconds.",
+                matched, moved, unresolvedProp, unresolvedClass);
+
+        InterlockedExchange(&g_offsetVerifyRunning, 0);
+        return 0;
+    }
+}
+
+void Features::DebugVerifyMemberOffsets()
+{
+    if (!G::sdkReady.load()) { LOG("VerifyOffsets: SDK not ready"); return; }
+    if (InterlockedCompareExchange(&g_offsetVerifyRunning, 1, 0) != 0)
+    {
+        LOG("VerifyOffsets: already running");
+        return;
+    }
+    HANDLE t = CreateThread(nullptr, 0, VerifyOffsetsThread, nullptr, 0, nullptr);
+    if (!t)
+    {
+        InterlockedExchange(&g_offsetVerifyRunning, 0);
+        LOG("VerifyOffsets: thread spawn failed err=%lu", GetLastError());
+        return;
+    }
+    CloseHandle(t);
+}
+
 // Diagnostic: log nearby volume/trigger actors so we can identify the out-of-bounds
 // teleporter (e.g. the lighthouse one) and disable it precisely next. Background
 // thread (reads names over the level actor list -- no ProcessEvent).
@@ -13231,6 +13936,7 @@ void Features::Prewarm()
         FindObjectFast(AH::Cls_MeshComponent);
         FindObjectFast(AH::Cls_Light);
         StartObjectNameIndex();
+        LogNativeHookRvaSelfCheck();
 
         LOG("Prewarm complete in %llums", GetTickCount64() - startMs);
     }
@@ -13286,49 +13992,25 @@ void Features::SavePosition()
     catch (...) { LOG("SavePosition: exception (ignored)"); }
 }
 
+// Both are menu clicks, i.e. the render thread.
 void Features::TeleportToSaved()
 {
-    try
+    if (!g_state.hasSaved)
     {
-        if (!g_state.hasSaved)
-        {
-            LOG("TeleportToSaved failed: no saved position.");
-            return;
-        }
-        UObject* pawn = GetLocalPawn();
-        if (!SetActorLocation(pawn, g_state.savedLocation, true))
-        {
-            LOG("TeleportToSaved failed: pawn=%p", (void*)pawn);
-            return;
-        }
-        LOG("Teleported to saved position %.1f %.1f %.1f",
-            g_state.savedLocation.X, g_state.savedLocation.Y, g_state.savedLocation.Z);
+        LOG("TeleportToSaved failed: no saved position.");
+        return;
     }
-    catch (...) { LOG("TeleportToSaved: exception (ignored)"); }
+    QueueTeleport(g_state.savedLocation, false, "Teleported to saved position");
 }
 
 void Features::ReturnToFlyStart()
 {
-    try
+    if (!g_state.hasFlyStart)
     {
-        if (!g_state.hasFlyStart)
-        {
-            LOG("ReturnToFlyStart failed: no fly start captured.");
-            return;
-        }
-
-        UObject* pawn = GetLocalPawn();
-        if (!SetActorLocation(pawn, g_state.flyStartLocation, true))
-        {
-            LOG("ReturnToFlyStart failed: pawn=%p", (void*)pawn);
-            return;
-        }
-
-        RefreshFlyStreaming(pawn, true);
-        LOG("Returned to fly start %.1f %.1f %.1f",
-            g_state.flyStartLocation.X, g_state.flyStartLocation.Y, g_state.flyStartLocation.Z);
+        LOG("ReturnToFlyStart failed: no fly start captured.");
+        return;
     }
-    catch (...) { LOG("ReturnToFlyStart: exception (ignored)"); }
+    QueueTeleport(g_state.flyStartLocation, true, "Returned to fly start");
 }
 
 void Features::RefillAmmoNow()
@@ -13538,10 +14220,16 @@ int Features::GiveAllWeapons(bool equipLast)
 // Get (+cache) the AI pawn's UMercunaNavigationComponent. Game-thread only (no mutex).
 static UObject* GetMercunaNavComp(UObject* ai)
 {
-    static std::unordered_map<UObject*, UObject*> cache;
+    // Keyed by the pawn's ADDRESS, which the allocator reuses, so liveness alone
+    // would hand a new pawn the destroyed one's nav component -- both sides pass
+    // IsLiveObject in that case. Pin the class the key resolved as, the way
+    // PinnedSubsystem does, so a recycled slot reads as a miss.
+    struct NavEntry { UObject* comp; UObject* aiClass; };
+    static std::unordered_map<UObject*, NavEntry> cache;
     auto it = cache.find(ai);
-    if (it != cache.end() && Mem::IsReadable(it->second, 0x30))
-        return it->second;
+    if (it != cache.end() && IsLiveObject(ai) && IsLiveObject(it->second.comp) &&
+        ai->Class() == it->second.aiClass)
+        return it->second.comp;
     static UClass* navCls = nullptr;
     if (!Mem::IsReadable(navCls, 0x30)) navCls = FindObjectFast(AH::Cls_MercunaNavComponent);
     UFunction* fn = CachedFn(AH::Fn_ActorGetComponentsByClass);
@@ -13557,7 +14245,7 @@ static UObject* GetMercunaNavComp(UObject* ai)
             found = p.ReturnValue.Data[0];
     }
     catch (...) {}
-    if (Mem::IsReadable(found, 0x30)) { cache[ai] = found; return found; }
+    if (IsLiveObject(found) && IsLiveObject(ai)) { cache[ai] = { found, ai->Class() }; return found; }
     return nullptr;
 }
 
@@ -14920,12 +15608,12 @@ static void TickImpl()
             st.hasFlyStart = true;
             LOG("Fly start captured %.1f %.1f %.1f", currentLoc.X, currentLoc.Y, currentLoc.Z);
         }
-        RefreshFlyStreaming(pawn, true);
+        ScheduleFlyStreamingRefresh(pawn);
     }
     else if (!freeFly && wasFreeFly)
     {
-        RefreshFlyStreaming(pawn, true);
-        LOG("Fly/noclip disabled; streaming assist refreshed at current pawn location.");
+        ScheduleFlyStreamingRefresh(pawn);
+        LOG("Fly/noclip disabled; streaming assist queued at current pawn location.");
     }
 
     // Noclip toggles the pawn's collision (edge-triggered, and re-applied if the
@@ -14962,10 +15650,9 @@ static void TickImpl()
 
             if (freeFly)
             {
-                *reinterpret_cast<uint8_t*>(mv + AH::Move_MovementMode) = AH::MOVE_Flying;
                 *reinterpret_cast<float*>(mv + AH::Move_MaxFlySpeed) = 600.0f * st.speedMult;
-                if (haveLoc)
-                    ApplyMinecraftFly(pawn, currentLoc, dt);
+                // Movement mode + the actual move happen on the GAME thread.
+                ScheduleFlyStep(pawn, dt);
             }
 
             // super jump / low gravity: capture the original on first enable so
