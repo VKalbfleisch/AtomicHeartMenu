@@ -700,16 +700,32 @@ namespace
     constexpr float kGodDamageMultiplier = 0.0f;
     constexpr float kOneHitDamageMultiplier = 1000.0f;
 
+    // Render thread only. The success count lives outside it: that is written on
+    // the pump, and an atomic member would make the `= {}` reset ill-formed.
     struct GiveAllState
     {
         bool active = false;
         bool equipLast = false;
         int index = 0;
-        int ok = 0;
         ULONGLONG lastStepMs = 0;
     };
 
     GiveAllState g_giveAll;
+    std::atomic<int> g_giveAllOk{ 0 };
+
+    // A fault inside game code leaves the engine part-way through an inventory
+    // mutation, and a second grant on top of a half-written container is how one
+    // survivable fault becomes an unrecoverable one. Only a restart clears this.
+    std::atomic<bool> g_giveWeaponFaulted{ false };
+
+    bool GiveWeaponLatched(const char* what)
+    {
+        if (!g_giveWeaponFaulted.load())
+            return false;
+        LOG("%s refused: an earlier grant faulted inside game code this session, so "
+            "the inventory may be mid-mutation. Restart the game.", what);
+        return true;
+    }
 
     struct AttrBackup
     {
@@ -1938,6 +1954,7 @@ namespace
     UClass*                    g_aiControllerClass = nullptr;
     UClass*                    g_pawnClass = nullptr;
     UClass*                    g_characterClass = nullptr;
+    UClass*                    g_playerCharacterClass = nullptr;
     std::atomic<int>           g_aiCachedCount{ 0 };
     std::atomic<int>           g_aiPendingCount{ 0 };
     std::atomic<bool>          g_aiDiscoveryRequested{ false };
@@ -2330,6 +2347,29 @@ namespace
         if (!Mem::IsReadable(pawn, 0x30))
             return false;
         UClass* cls = ResolvePawnClass();
+        if (!Mem::IsReadable(cls, 0x30))
+            return false;
+        return pawn->IsA(cls);
+    }
+
+    UClass* ResolvePlayerCharacterClass()
+    {
+        if (!Mem::IsReadable(g_playerCharacterClass, 0x30))
+            g_playerCharacterClass = FindObjectFast(AH::Cls_AHPlayerCharacter);
+        return Mem::IsReadable(g_playerCharacterClass, 0x30) ? g_playerCharacterClass : nullptr;
+    }
+
+    // ProcessEvent does not check that its receiver is of the class the function
+    // belongs to, so an AHPlayerCharacter-only function reaching any other pawn --
+    // a cutscene pawn, a turret, anything possessed between the click and the drain
+    // -- has the native thunk read members that class does not define. Refusing when
+    // the class will not resolve is deliberate: an unprovable receiver is exactly
+    // the case that faults.
+    bool PlayerCharacterUsable(UObject* pawn)
+    {
+        if (!Mem::IsReadable(pawn, 0x30))
+            return false;
+        UClass* cls = ResolvePlayerCharacterClass();
         if (!Mem::IsReadable(cls, 0x30))
             return false;
         return pawn->IsA(cls);
@@ -8973,25 +9013,102 @@ namespace
         });
     }
 
+    // Reading the expected class off the function follows a patch that retypes the
+    // parameter rather than guessing it. Worth checking at all because the
+    // object-name fallback that resolves these assets matches on a name substring
+    // alone and cannot rule out a wrong type by itself.
+    bool WeaponAssetAcceptedBy(UFunction* fn, const char* paramName, UObject* asset, const char* what)
+    {
+        UClass* want = Reflect::ObjectPropertyClassInStruct(fn, paramName);
+        if (!want)
+        {
+            // Passing silently would leave the log looking like the asset was
+            // checked when a renamed parameter means nothing was. Game thread only,
+            // so the set needs no lock.
+            static std::unordered_set<std::string> reported;
+            if (reported.insert(what).second)
+                LOG("%s: parameter '%s' did not resolve, so the asset type is NOT "
+                    "being checked on this build", what, paramName);
+            return true;
+        }
+        if (asset->IsA(want))
+            return true;
+
+        std::string got;
+        std::string wanted;
+        try { got = asset->GetFullName(); } catch (...) {}
+        try { wanted = want->GetName(); } catch (...) {}
+        LOG("%s refused: asset %s is not a %s", what, got.c_str(), wanted.c_str());
+        return false;
+    }
+
+    // ProcessEvent writes out-params and the return value straight into the buffer
+    // it is handed, sized by the LIVE UFunction rather than by the P_* struct we
+    // copied from a dump of build 18319896. A struct smaller than this build's
+    // params block is not a wrong value, it is a smashed caller frame -- see the
+    // kParamsChecks note. So the buffer is sized from PropertiesSize, and any
+    // difference is logged once per function because it means our struct is stale.
+    template <typename P>
+    bool CallWithParams(UObject* self, UFunction* fn, P& params, const char* what)
+    {
+        uint8_t* fnBytes = reinterpret_cast<uint8_t*>(fn);
+        int32_t needed = 0;
+        if (Mem::IsReadable(fnBytes + Offsets::O_UStruct_PropertiesSize, 4))
+            needed = *reinterpret_cast<int32_t*>(fnBytes + Offsets::O_UStruct_PropertiesSize);
+
+        if (needed < 0 || needed > 0x10000)
+        {
+            LOG("%s refused: UFunction::PropertiesSize=%d is not a believable params "
+                "block, so the buffer size cannot be trusted", what, needed);
+            return false;
+        }
+
+        if (needed <= (int32_t)sizeof(P))
+            return self->ProcessEvent(fn, &params);
+
+        static std::unordered_set<std::string> reported;
+        if (reported.insert(what).second)
+            LOG("%s: this build wants %d params bytes, our struct is %d -- passing a "
+                "sized buffer instead. The P_* struct is stale for this build.",
+                what, needed, (int)sizeof(P));
+
+        std::vector<uint8_t> buf((size_t)needed, 0);
+        memcpy(buf.data(), &params, sizeof(P));
+        if (!self->ProcessEvent(fn, buf.data()))
+            return false;
+        memcpy(&params, buf.data(), sizeof(P));
+        return true;
+    }
+
+    // Callers must already be on the pump: both mutate inventory and
+    // equipped-weapon state.
     bool InvokeTakeWeapon(UObject* pawn, UObject* asset)
     {
         if (!pawn || !asset)
             return false;
 
+        if (!PlayerCharacterUsable(pawn))
+        {
+            LOG("TakeWeapon refused: pawn=%p is not an %s", (void*)pawn, AH::Cls_AHPlayerCharacter);
+            return false;
+        }
+
         if (UFunction* instant = CachedFn(AH::Fn_InstantTakeWeapon))
         {
+            if (!WeaponAssetAcceptedBy(instant, "WeaponItemDataAsset", asset, "InstantTakeWeapon"))
+                return false;
             P_WeaponDataAsset p{ asset };
-            pawn->ProcessEvent(instant, &p);
-            return true;
+            return CallWithParams(pawn, instant, p, "InstantTakeWeapon");
         }
 
         if (UFunction* take = CachedFn(AH::Fn_TakeWeapon))
         {
+            if (!WeaponAssetAcceptedBy(take, "WeaponItemDataAsset", asset, "TakeWeapon"))
+                return false;
             P_TakeWeapon p{};
             p.WeaponItemDataAsset = asset;
             p.bInstant = true;
-            pawn->ProcessEvent(take, &p);
-            return true;
+            return CallWithParams(pawn, take, p, "TakeWeapon");
         }
 
         return false;
@@ -9003,9 +9120,16 @@ namespace
         if (!pawn || !asset || !equip)
             return false;
 
+        if (!PlayerCharacterUsable(pawn))
+        {
+            LOG("EquipWeapon refused: pawn=%p is not an %s", (void*)pawn, AH::Cls_AHPlayerCharacter);
+            return false;
+        }
+        if (!WeaponAssetAcceptedBy(equip, "WeaponItemDataAsset", asset, "EquipWeaponByDataAsset"))
+            return false;
+
         P_WeaponDataAsset p{ asset };
-        pawn->ProcessEvent(equip, &p);
-        return true;
+        return CallWithParams(pawn, equip, p, "EquipWeaponByDataAsset");
     }
 
     bool WriteInt32Field(void* base, int offset, int32_t value)
@@ -11907,6 +12031,12 @@ namespace
         }
     }
 
+    // GAME THREAD ONLY. Each dispatch is wrapped on its own: one try around both
+    // named neither, so the original report could not say whether the take or the
+    // equip died. The catches are not a recovery -- unwinding back out through
+    // engine frames is what turns such a fault into a hang -- they exist so the log
+    // names the call, and so the latch stops a second grant stacking another fault
+    // on the first.
     bool GiveWeaponInternal(int index, bool equip)
     {
         if (index < 0 || index >= Features::WeaponCount())
@@ -11914,6 +12044,9 @@ namespace
             LOG("GiveWeapon failed: invalid index=%d", index);
             return false;
         }
+
+        if (GiveWeaponLatched("GiveWeapon"))
+            return false;
 
         UObject* pawn = GetLocalPawn();
         if (!pawn)
@@ -11931,26 +12064,57 @@ namespace
         }
 
         ULONGLONG startMs = GetTickCount64();
-        bool takeCalled = InvokeTakeWeapon(pawn, asset);
-        bool equipCalled = equip ? EquipWeapon(pawn, asset) : false;
-        bool ok = takeCalled || equipCalled;
-        ULONGLONG elapsedMs = GetTickCount64() - startMs;
 
-        LOG("GiveWeapon %s: asset=%p takeCalled=%s equip=%s/%s ok=%s time=%llums",
-            weapon.label, (void*)asset,
-            takeCalled ? "yes" : "no",
-            equip ? "requested" : "no",
-            equipCalled ? "called" : "not-called",
-            ok ? "yes" : "no",
-            elapsedMs);
+        bool takeCalled = false;
+        try { takeCalled = InvokeTakeWeapon(pawn, asset); }
+        catch (...)
+        {
+            g_giveWeaponFaulted = true;
+            LOG("GiveWeapon %s: FAULTED inside the take call. Game state is not "
+                "trustworthy from here -- expect a freeze; restart the game.", weapon.label);
+            return false;
+        }
 
-        return ok;
+        bool equipCalled = false;
+        if (equip)
+        {
+            try { equipCalled = EquipWeapon(pawn, asset); }
+            catch (...)
+            {
+                g_giveWeaponFaulted = true;
+                LOG("GiveWeapon %s: FAULTED inside the equip call (take returned %s). "
+                    "Game state is not trustworthy from here -- expect a freeze; "
+                    "restart the game.", weapon.label, takeCalled ? "true" : "false");
+                return false;
+            }
+        }
+
+        // The package path is the one thing a report cannot reconstruct, so it stays
+        // -- but on the single line the grant already logs, not a second one.
+        std::string assetFull;
+        try { assetFull = asset->GetFullName(); } catch (...) {}
+        LOG("GiveWeapon %s: %s%s %s", weapon.label,
+            takeCalled ? "taken" : "TAKE FAILED",
+            equipCalled ? ", equipped" : "",
+            assetFull.c_str());
+
+        return takeCalled;
     }
 
+    // Paced from the render tick, executed on the pump: this only decides when the
+    // next grant is due and hands it over.
     void ProcessGiveAllQueue()
     {
         if (!g_giveAll.active)
             return;
+
+        if (g_giveWeaponFaulted.load())
+        {
+            LOG("GiveAllWeapons abandoned at %d/%d: an earlier grant faulted inside "
+                "game code.", g_giveAll.index, Features::WeaponCount());
+            g_giveAll = {};
+            return;
+        }
 
         ULONGLONG nowMs = GetTickCount64();
         if (g_giveAll.lastStepMs && nowMs - g_giveAll.lastStepMs < 75)
@@ -11959,16 +12123,22 @@ namespace
         int count = Features::WeaponCount();
         if (g_giveAll.index >= count)
         {
-            LOG("GiveAllWeapons complete: ok=%d/%d", g_giveAll.ok, count);
+            LOG("GiveAllWeapons complete: %d/%d granted, the rest skipped for lack of "
+                "content in this install", g_giveAllOk.load(), count);
             g_giveAll = {};
             return;
         }
 
         int i = g_giveAll.index++;
         bool equip = g_giveAll.equipLast && i == count - 1;
-        if (GiveWeaponInternal(i, equip))
-            ++g_giveAll.ok;
+        // Stamped before the queue, not after the grant, so the 75 ms paces
+        // dispatch intervals rather than drifting with the pump's pickup delay.
         g_giveAll.lastStepMs = GetTickCount64();
+        QueueGameThread([i, equip]()
+        {
+            if (GiveWeaponInternal(i, equip))
+                ++g_giveAllOk;
+        });
     }
 
     bool HasPawnFeatureWork(const Features::State& st)
@@ -13535,6 +13705,12 @@ namespace
 
     const ParamsCheck kParamsChecks[] =
     {
+        // Weapon grant path -- issue #6. Never covered here before, and the
+        // FindWeaponByDataAsset struct had never been exercised at all.
+        { AH::Fn_InstantTakeWeapon,       (int)sizeof(P_WeaponDataAsset),   "P_WeaponDataAsset (InstantTakeWeapon)" },
+        { AH::Fn_TakeWeapon,              (int)sizeof(P_TakeWeapon),        "P_TakeWeapon" },
+        { AH::Fn_EquipWeaponByDataAsset,  (int)sizeof(P_WeaponDataAsset),   "P_WeaponDataAsset (EquipWeaponByDataAsset)" },
+        { AH::Fn_FindWeaponByDataAsset,   (int)sizeof(P_FindWeaponByDataAsset), "P_FindWeaponByDataAsset" },
         // Fly / noclip path -- the one issue #3 ran through.
         { AH::Fn_SetActorLocation,        (int)sizeof(P_SetActorLocation),  "P_SetActorLocation" },
         { AH::Fn_GetActorLocation,        (int)sizeof(P_GetActorLocation),  "P_GetActorLocation" },
@@ -14180,6 +14356,12 @@ void Features::CompleteActiveQuests()
     catch (...) { LOG("CompleteActiveQuests: exception (ignored)"); }
 }
 
+// Called from the ImGui button, which runs inside the Present hook. A grant is
+// structural work -- inventory mutation, weapon actor spawn and attach, the equip
+// state machine -- and dispatching a UFunction for it off the game thread is what
+// issue #6 faulted on. The pawn is resolved on the pump rather than captured here,
+// so a possession change between the click and the drain cannot hand game code a
+// pawn that is no longer the player's.
 bool Features::GiveWeapon(int index, bool equip)
 {
     if (!G::sdkReady.load())
@@ -14187,8 +14369,27 @@ bool Features::GiveWeapon(int index, bool equip)
         LOG("GiveWeapon failed: SDK not ready");
         return false;
     }
-    try { return GiveWeaponInternal(index, equip); }
-    catch (...) { LOG("GiveWeapon: exception (ignored)"); return false; }
+    if (index < 0 || index >= WeaponCount())
+    {
+        LOG("GiveWeapon failed: invalid index=%d", index);
+        return false;
+    }
+    // Ask here as well as on the pump: a refusal the player caused should answer the
+    // click, not arrive a frame later from a task they cannot see.
+    if (GiveWeaponLatched("GiveWeapon"))
+        return false;
+    if (!InstallProcessEventHook())
+    {
+        LOG("GiveWeapon skipped: no game-thread pump (ProcessEvent hook unavailable).");
+        return false;
+    }
+
+    QueueGameThread([index, equip]()
+    {
+        try { GiveWeaponInternal(index, equip); }
+        catch (...) { LOG("GiveWeapon: exception (ignored)"); }
+    });
+    return true;
 }
 
 int Features::GiveAllWeapons(bool equipLast)
@@ -14199,17 +14400,28 @@ int Features::GiveAllWeapons(bool equipLast)
         return 0;
     }
 
+    if (GiveWeaponLatched("GiveAllWeapons"))
+        return 0;
+    // The run is paced by ProcessGiveAllQueue on the render tick, but every grant
+    // it schedules lands on the pump, so the hook has to exist before we start.
+    if (!InstallProcessEventHook())
+    {
+        LOG("GiveAllWeapons skipped: no game-thread pump (ProcessEvent hook unavailable).");
+        return 0;
+    }
+
     try
     {
         if (g_giveAll.active)
         {
-            LOG("GiveAllWeapons already running: index=%d ok=%d/%d", g_giveAll.index, g_giveAll.ok, WeaponCount());
-            return g_giveAll.ok;
+            LOG("GiveAllWeapons already running: index=%d ok=%d/%d", g_giveAll.index, g_giveAllOk.load(), WeaponCount());
+            return g_giveAllOk.load();
         }
 
         g_giveAll = {};
         g_giveAll.active = true;
         g_giveAll.equipLast = equipLast;
+        g_giveAllOk = 0;
         LOG("GiveAllWeapons queued: count=%d equipLast=%s", WeaponCount(), equipLast ? "yes" : "no");
     }
     catch (...) { LOG("GiveAllWeapons: exception (ignored)"); }
@@ -15486,6 +15698,10 @@ static void TickImpl()
     // Render-hijack visuals (chams / world tint) are marshalled to the game
     // thread too -- independent of the pawn, so schedule before the pawn gate.
     ScheduleVisualGameThreadWork();
+    // Above the pawn gate on purpose: it only paces the run and hands each grant to
+    // the pump, which resolves its own pawn. Below the gate it advanced only while
+    // some unrelated pawn feature was enabled.
+    ProcessGiveAllQueue();
 
     if (!HasPawnFeatureWork(st))
         return;
@@ -15514,8 +15730,6 @@ static void TickImpl()
         lastPawn = pawn;
     }
     uint8_t* p = reinterpret_cast<uint8_t*>(pawn);
-
-    ProcessGiveAllQueue();
 
     // --- coordinate readout -------------------------------------------------
     FVector currentLoc{};

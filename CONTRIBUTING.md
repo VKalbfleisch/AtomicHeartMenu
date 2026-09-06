@@ -54,7 +54,14 @@ This DLL must never crash the game. Follow the existing safety model:
   reads fine still DEP-faults on the call - after control has left our code, where
   `catch(...)` can no longer reach it.
 - Wrap any risky operation (anything that calls into game code) in `try/catch`. The
-  build uses `/EHa`, so `catch(...)` also traps access violations.
+  build uses `/EHa`, so `catch(...)` also traps access violations. It is not a
+  recovery, though: a fault raised inside engine code unwinds back out through
+  frames that were never written to be unwound, so whatever they held is never
+  released and the symptom is a hang rather than a crash. Prefer not making a call
+  you cannot prove is safe over catching what it throws.
+- `UObject::ProcessEvent` returns whether it actually dispatched; it refuses on a
+  dead object rather than faulting. Check that result before reporting to the user
+  or the log that the game did something.
 - Do not run structural or heavy work on the render (Present) thread. Use the
   worker thread or the game-thread pump, the way the existing features do. This
   covers more than it looks: `K2_SetActorLocation` is not a property write but a

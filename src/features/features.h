@@ -223,8 +223,10 @@ namespace Features
     void WinCurrentQTE();      // call Atomic Heart debug QTE win
     void SkipObjective();      // advance every active quest one step (skip current objective)
     void CompleteActiveQuests(); // mark every active quest fully complete
-    bool GiveWeapon(int index, bool equip); // grant one weapon data asset
-    int  GiveAllWeapons(bool equipLast);    // grant every listed weapon
+    // Both grants run on the game-thread pump, so these report only that the
+    // request was accepted, never that the weapon arrived.
+    bool GiveWeapon(int index, bool equip); // queue one weapon data asset grant
+    int  GiveAllWeapons(bool equipLast);    // queue a grant of every listed weapon
     int  AiCachedCount();
     int  AiPendingCount();
     int  AiQueueKillNearby();
