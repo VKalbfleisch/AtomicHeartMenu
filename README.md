@@ -258,7 +258,11 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
   wrong-class asset is refused instead of dispatched. The **equip is deferred and
   retried** rather than issued in the same breath as the grant: the take returns
   before the weapon actor exists, and equipping an asset with no instance yet does
-  nothing, which left the weapon in the wheel but not in your hands. The
+  nothing, which left the weapon in the wheel but not in your hands. **Weapons with
+  no content in your install are skipped before the grant**: those still take but
+  arrive as named empty storage slots with no model, which crash on equip and wedge
+  weapon switching if selected. The check reads the live asset rather than a
+  hardcoded list, so a patch or a DLC purchase moves the set on its own. The
   Kalash rifle is listed as **Kalash Rifle / AK-47**
   (`DA_Item_AK47`)
 - **AI / Squad tab** - full control over the AI (the headline feature):

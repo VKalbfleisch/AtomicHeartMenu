@@ -9153,6 +9153,90 @@ namespace
         return Mem::LooksLikePtr(p.ReturnValue) ? static_cast<UObject*>(p.ReturnValue) : nullptr;
     }
 
+    // Whether this weapon has real content behind it in this install.
+    //
+    // Some entries in kWeapons resolve to a data asset that carries no content. One
+    // of those still takes, and lands in storage as a named but EMPTY slot with no
+    // model; equipping it kills the game, and reaching it through the game's own
+    // weapon wheel wedges weapon switching. So it must not be granted at all.
+    //
+    // LargeIcon separates the two: set on every weapon confirmed working, unset on
+    // PTRD (the crash) and on the empty storage slots. It split 19 usable from 18
+    // stubs, and the SAME 18 in a base game session and a DLC2 one -- so this is a
+    // property of the install, not of which campaign is loaded. Reading it live is
+    // still what avoids hardcoding that set, which a patch or a DLC purchase moves.
+    //
+    // A correlate, not a proven cause, so WeaponModelReady still backs it up after
+    // the take.
+    bool WeaponAssetHasContent(UObject* asset, const char* label)
+    {
+        if (!Mem::IsReadable(asset, 0x30))
+            return false;
+
+        if (Reflect::ReadNamedObjectProperty(asset, "LargeIcon"))
+            return true;
+
+        // Absent property, not an unset one: this build names it something else, and
+        // refusing every weapon over a rename would be worse than granting.
+        if (Reflect::FindPropertyOffsetInStruct(asset->Class(), "LargeIcon") < 0)
+        {
+            static bool warned = false;
+            if (!warned)
+            {
+                warned = true;
+                LOG("GiveWeapon: no LargeIcon property on this build, so weapons cannot "
+                    "be checked for content before granting.");
+            }
+            return true;
+        }
+
+        LOG("GiveWeapon %s: skipped, no content in this install (LargeIcon unset)", label);
+        return false;
+    }
+
+    // Whether a spawned weapon actually has a model behind it.
+    //
+    // A weapon whose content was never mounted still takes and still shows in
+    // storage, as a named but EMPTY slot -- the item exists, the mesh does not.
+    // Equipping one of those is what kills the game (PTRD in a base game session,
+    // deterministically), and reaching it through the wheel instead wedges weapon
+    // switching entirely, so this is the game's own bug and not something our
+    // dispatch can be made safe against. All we can do is not ask for it.
+    //
+    // Fail-closed: anything we cannot read counts as not ready. A refused equip
+    // leaves the weapon in the inventory, which is recoverable; a wrong "yes" is
+    // not.
+    bool WeaponModelReady(UObject* weapon, const char* label)
+    {
+        if (!Mem::IsReadable(weapon, 0x30))
+            return false;
+
+        UObject* mesh = Reflect::ReadNamedObjectProperty(weapon, "Mesh");
+        if (!mesh && Mem::IsReadable(reinterpret_cast<uint8_t*>(weapon) + AH::Weapon_Mesh, sizeof(void*)))
+            mesh = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(weapon) + AH::Weapon_Mesh);
+        if (!Mem::IsReadable(mesh, 0x30))
+        {
+            LOG("Equip %s refused: the spawned weapon has no mesh component, so it has "
+                "no model in this session. Equipping it crashes the game.", label);
+            return false;
+        }
+
+        // USkeletalMeshComponent::SkeletalMesh / UStaticMeshComponent::StaticMesh are
+        // engine property names, so this reads the same on any UE4.27 build.
+        UObject* asset = Reflect::ReadNamedObjectProperty(mesh, "SkeletalMesh");
+        if (!asset)
+            asset = Reflect::ReadNamedObjectProperty(mesh, "StaticMesh");
+        if (!Mem::IsReadable(asset, 0x30))
+        {
+            LOG("Equip %s refused: mesh component %p carries no mesh asset, so the "
+                "weapon has no model in this session. Equipping it crashes the game.",
+                label, (void*)mesh);
+            return false;
+        }
+
+        return true;
+    }
+
     bool EquipWeapon(UObject* pawn, UObject* asset)
     {
         UFunction* equip = CachedFn(AH::Fn_EquipWeaponByDataAsset);
@@ -12100,6 +12184,9 @@ namespace
             return false;
         }
 
+        if (!WeaponAssetHasContent(asset, weapon.label))
+            return false;
+
         ULONGLONG startMs = GetTickCount64();
 
         bool takeCalled = false;
@@ -12150,13 +12237,25 @@ namespace
             return;
         }
 
-        // With no readiness test on this build, equip on the first deferred attempt
-        // rather than never equipping at all: one pump hop after the take still
-        // beats the same-call ordering that did nothing.
-        bool canTest = CachedFn(AH::Fn_FindWeaponByDataAsset) != nullptr;
-        UObject* instance = canTest ? FindWeaponInstance(pawn, asset) : nullptr;
-        if (canTest && !instance)
+        // Without FindWeaponByDataAsset there is no instance to inspect, and
+        // WeaponModelReady is the only thing between a modelless weapon and a dead
+        // game -- so refuse rather than equip blind.
+        if (!CachedFn(AH::Fn_FindWeaponByDataAsset))
+        {
+            LOG("Equip %s refused: FindWeaponByDataAsset is missing on this build, so "
+                "the weapon's model cannot be checked first.", label.c_str());
+            ClearPendingEquip();
+            return;
+        }
+        UObject* instance = FindWeaponInstance(pawn, asset);
+        if (!instance)
             return; // still spawning; the pacer comes back
+
+        if (!WeaponModelReady(instance, label.c_str()))
+        {
+            ClearPendingEquip();
+            return;
+        }
 
         if (!EquipWeapon(pawn, asset))
         {
@@ -12167,7 +12266,7 @@ namespace
 
         UObject* current = GetCurrentWeaponObject(pawn);
         LOG("Equip %s: %s after %d attempt(s)", label.c_str(),
-            (instance && current == instance) ? "in hand" : "called, swap in flight", attempt);
+            current == instance ? "in hand" : "called, swap still in flight", attempt);
         ClearPendingEquip();
     }
 
