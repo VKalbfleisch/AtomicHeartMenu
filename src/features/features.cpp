@@ -9099,8 +9099,7 @@ namespace
         return true;
     }
 
-    // Callers must already be on the pump: both mutate inventory and
-    // equipped-weapon state.
+    // Game-thread only: mutates the inventory.
     bool InvokeTakeWeapon(UObject* pawn, UObject* asset)
     {
         if (!pawn || !asset)
@@ -9194,18 +9193,10 @@ namespace
         return false;
     }
 
-    // Whether a spawned weapon actually has a model behind it.
-    //
-    // A weapon whose content was never mounted still takes and still shows in
-    // storage, as a named but EMPTY slot -- the item exists, the mesh does not.
-    // Equipping one of those is what kills the game (PTRD in a base game session,
-    // deterministically), and reaching it through the wheel instead wedges weapon
-    // switching entirely, so this is the game's own bug and not something our
-    // dispatch can be made safe against. All we can do is not ask for it.
-    //
-    // Fail-closed: anything we cannot read counts as not ready. A refused equip
-    // leaves the weapon in the inventory, which is recoverable; a wrong "yes" is
-    // not.
+    // The backstop to WeaponAssetHasContent, asked of the spawned weapon rather
+    // than the asset. Fail-closed: anything unreadable counts as not ready, because
+    // a refused equip leaves a usable weapon in the inventory while a wrong "yes"
+    // ends the session.
     bool WeaponModelReady(UObject* weapon, const char* label)
     {
         if (!Mem::IsReadable(weapon, 0x30))
@@ -9237,6 +9228,7 @@ namespace
         return true;
     }
 
+    // Game-thread only: drives the equipped-weapon state machine.
     bool EquipWeapon(UObject* pawn, UObject* asset)
     {
         UFunction* equip = CachedFn(AH::Fn_EquipWeaponByDataAsset);
@@ -12156,8 +12148,7 @@ namespace
 
     // GAME THREAD ONLY. The catch is not a recovery -- unwinding back out through
     // engine frames is what turns such a fault into a hang -- it exists so the log
-    // names the take as the dispatch that died, and so the latch stops a second
-    // grant stacking another fault on the first.
+    // names the take as the dispatch that died.
     bool GiveWeaponInternal(int index, bool equip)
     {
         if (index < 0 || index >= Features::WeaponCount())
@@ -12209,8 +12200,7 @@ namespace
             g_pendingEquip.label = weapon.label;
         }
 
-        // The package path is the one thing a report cannot reconstruct, so it stays
-        // -- but on the single line the grant already logs, not a second one.
+        // The package path is the one thing a report cannot reconstruct.
         std::string assetFull;
         try { assetFull = asset->GetFullName(); } catch (...) {}
         LOG("GiveWeapon %s: %s%s %s", weapon.label,
@@ -12270,8 +12260,7 @@ namespace
         ClearPendingEquip();
     }
 
-    // Paced from the render tick, executed on the pump, for the same reason the
-    // grants are: the equip is a UFunction dispatch, and the retry interval has to
+    // Paced from the render tick, executed on the pump: the retry interval has to
     // be measured somewhere that ticks once a frame.
     void ProcessPendingEquip()
     {
@@ -12319,8 +12308,8 @@ namespace
         });
     }
 
-    // Paced from the render tick, executed on the pump: this only decides when the
-    // next grant is due and hands it over.
+    // Decides when the next grant is due and hands it over; the grant itself runs
+    // on the pump.
     void ProcessGiveAllQueue()
     {
         if (!g_giveAll.active)
@@ -13923,8 +13912,7 @@ namespace
 
     const ParamsCheck kParamsChecks[] =
     {
-        // Weapon grant path -- issue #6. Never covered here before, and the
-        // FindWeaponByDataAsset struct had never been exercised at all.
+        // Weapon grant path -- issue #6.
         { AH::Fn_InstantTakeWeapon,       (int)sizeof(P_WeaponDataAsset),   "P_WeaponDataAsset (InstantTakeWeapon)" },
         { AH::Fn_TakeWeapon,              (int)sizeof(P_TakeWeapon),        "P_TakeWeapon" },
         { AH::Fn_EquipWeaponByDataAsset,  (int)sizeof(P_WeaponDataAsset),   "P_WeaponDataAsset (EquipWeaponByDataAsset)" },
