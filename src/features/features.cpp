@@ -718,6 +718,25 @@ namespace
     // survivable fault becomes an unrecoverable one. Only a restart clears this.
     std::atomic<bool> g_giveWeaponFaulted{ false };
 
+    // InstantTakeWeapon returns before the weapon actor it spawns exists, and
+    // EquipWeaponByDataAsset against an asset with no instance yet returns having
+    // done nothing: the weapon lands in the inventory and shows in the wheel, but
+    // nothing reaches the player's hands. So the equip is paced on the render tick
+    // and retried on the pump until FindWeaponByDataAsset can name the instance.
+    struct PendingEquip
+    {
+        UObject*    asset = nullptr;
+        std::string label;
+        int         attempts = 0;
+        ULONGLONG   nextAttemptMs = 0;
+    };
+    std::mutex   g_pendingEquipMutex;
+    PendingEquip g_pendingEquip;
+    // 24 x 60 ms is about a second and a half, comfortably past a streaming hitch
+    // without leaving a doomed request retrying behind the player's back.
+    constexpr int       kEquipMaxAttempts = 24;
+    constexpr ULONGLONG kEquipRetryMs     = 60;
+
     bool GiveWeaponLatched(const char* what)
     {
         if (!g_giveWeaponFaulted.load())
@@ -9114,6 +9133,26 @@ namespace
         return false;
     }
 
+    // The readiness test for the equip: a non-null answer is the spawned weapon
+    // actor, so the equip has something to switch to. Null means the take has not
+    // finished spawning it yet.
+    UObject* FindWeaponInstance(UObject* pawn, UObject* asset)
+    {
+        UFunction* find = CachedFn(AH::Fn_FindWeaponByDataAsset);
+        if (!find || !pawn || !asset)
+            return nullptr;
+        if (!PlayerCharacterUsable(pawn))
+            return nullptr;
+        if (!WeaponAssetAcceptedBy(find, "WeaponItemDataAsset", asset, "FindWeaponByDataAsset"))
+            return nullptr;
+
+        P_FindWeaponByDataAsset p{};
+        p.WeaponItemDataAsset = asset;
+        if (!CallWithParams(pawn, find, p, "FindWeaponByDataAsset"))
+            return nullptr;
+        return Mem::LooksLikePtr(p.ReturnValue) ? static_cast<UObject*>(p.ReturnValue) : nullptr;
+    }
+
     bool EquipWeapon(UObject* pawn, UObject* asset)
     {
         UFunction* equip = CachedFn(AH::Fn_EquipWeaponByDataAsset);
@@ -12031,12 +12070,10 @@ namespace
         }
     }
 
-    // GAME THREAD ONLY. Each dispatch is wrapped on its own: one try around both
-    // named neither, so the original report could not say whether the take or the
-    // equip died. The catches are not a recovery -- unwinding back out through
-    // engine frames is what turns such a fault into a hang -- they exist so the log
-    // names the call, and so the latch stops a second grant stacking another fault
-    // on the first.
+    // GAME THREAD ONLY. The catch is not a recovery -- unwinding back out through
+    // engine frames is what turns such a fault into a hang -- it exists so the log
+    // names the take as the dispatch that died, and so the latch stops a second
+    // grant stacking another fault on the first.
     bool GiveWeaponInternal(int index, bool equip)
     {
         if (index < 0 || index >= Features::WeaponCount())
@@ -12075,18 +12112,14 @@ namespace
             return false;
         }
 
-        bool equipCalled = false;
-        if (equip)
+        if (equip && takeCalled)
         {
-            try { equipCalled = EquipWeapon(pawn, asset); }
-            catch (...)
-            {
-                g_giveWeaponFaulted = true;
-                LOG("GiveWeapon %s: FAULTED inside the equip call (take returned %s). "
-                    "Game state is not trustworthy from here -- expect a freeze; "
-                    "restart the game.", weapon.label, takeCalled ? "true" : "false");
-                return false;
-            }
+            std::lock_guard<std::mutex> lk(g_pendingEquipMutex);
+            if (g_pendingEquip.asset && g_pendingEquip.asset != asset)
+                LOG("Equip %s: superseded by %s", g_pendingEquip.label.c_str(), weapon.label);
+            g_pendingEquip = {};
+            g_pendingEquip.asset = asset;
+            g_pendingEquip.label = weapon.label;
         }
 
         // The package path is the one thing a report cannot reconstruct, so it stays
@@ -12095,10 +12128,96 @@ namespace
         try { assetFull = asset->GetFullName(); } catch (...) {}
         LOG("GiveWeapon %s: %s%s %s", weapon.label,
             takeCalled ? "taken" : "TAKE FAILED",
-            equipCalled ? ", equipped" : "",
+            (equip && takeCalled) ? ", equip deferred" : "",
             assetFull.c_str());
 
         return takeCalled;
+    }
+
+    void ClearPendingEquip()
+    {
+        std::lock_guard<std::mutex> lk(g_pendingEquipMutex);
+        g_pendingEquip = {};
+    }
+
+    void TryPendingEquipGameThread(UObject* asset, const std::string& label, int attempt)
+    {
+        UObject* pawn = GetLocalPawn();
+        if (!PlayerCharacterUsable(pawn) || !IsLiveObject(asset))
+        {
+            LOG("Equip %s: abandoned (pawn or asset no longer usable)", label.c_str());
+            ClearPendingEquip();
+            return;
+        }
+
+        // With no readiness test on this build, equip on the first deferred attempt
+        // rather than never equipping at all: one pump hop after the take still
+        // beats the same-call ordering that did nothing.
+        bool canTest = CachedFn(AH::Fn_FindWeaponByDataAsset) != nullptr;
+        UObject* instance = canTest ? FindWeaponInstance(pawn, asset) : nullptr;
+        if (canTest && !instance)
+            return; // still spawning; the pacer comes back
+
+        if (!EquipWeapon(pawn, asset))
+        {
+            LOG("Equip %s: refused by the gates", label.c_str());
+            ClearPendingEquip();
+            return;
+        }
+
+        UObject* current = GetCurrentWeaponObject(pawn);
+        LOG("Equip %s: %s after %d attempt(s)", label.c_str(),
+            (instance && current == instance) ? "in hand" : "called, swap in flight", attempt);
+        ClearPendingEquip();
+    }
+
+    // Paced from the render tick, executed on the pump, for the same reason the
+    // grants are: the equip is a UFunction dispatch, and the retry interval has to
+    // be measured somewhere that ticks once a frame.
+    void ProcessPendingEquip()
+    {
+        UObject* asset = nullptr;
+        std::string label;
+        int attempt = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_pendingEquipMutex);
+            if (!g_pendingEquip.asset)
+                return;
+            if (g_giveWeaponFaulted.load())
+            {
+                g_pendingEquip = {};
+                return;
+            }
+
+            ULONGLONG nowMs = GetTickCount64();
+            if (nowMs < g_pendingEquip.nextAttemptMs)
+                return;
+            if (g_pendingEquip.attempts >= kEquipMaxAttempts)
+            {
+                LOG("Equip %s: gave up after %d attempts -- FindWeaponByDataAsset never "
+                    "named an instance. The weapon is in the inventory; pick it from the wheel.",
+                    g_pendingEquip.label.c_str(), g_pendingEquip.attempts);
+                g_pendingEquip = {};
+                return;
+            }
+
+            asset = g_pendingEquip.asset;
+            label = g_pendingEquip.label;
+            attempt = ++g_pendingEquip.attempts;
+            g_pendingEquip.nextAttemptMs = nowMs + kEquipRetryMs;
+        }
+
+        QueueGameThread([asset, label, attempt]()
+        {
+            try { TryPendingEquipGameThread(asset, label, attempt); }
+            catch (...)
+            {
+                g_giveWeaponFaulted = true;
+                LOG("Equip %s: FAULTED inside the equip call. Game state is not "
+                    "trustworthy from here -- expect a freeze; restart the game.", label.c_str());
+                ClearPendingEquip();
+            }
+        });
     }
 
     // Paced from the render tick, executed on the pump: this only decides when the
@@ -15702,6 +15821,7 @@ static void TickImpl()
     // the pump, which resolves its own pawn. Below the gate it advanced only while
     // some unrelated pawn feature was enabled.
     ProcessGiveAllQueue();
+    ProcessPendingEquip();
 
     if (!HasPawnFeatureWork(st))
         return;

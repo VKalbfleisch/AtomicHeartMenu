@@ -255,7 +255,10 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
   therefore report only that the request was accepted; the result is logged a frame
   or so later. The receiver is checked with `IsA(AHPlayerCharacter)` and the asset
   against the type the UFunction's own parameter declares, so a non-player pawn or a
-  wrong-class asset is refused instead of dispatched. The
+  wrong-class asset is refused instead of dispatched. The **equip is deferred and
+  retried** rather than issued in the same breath as the grant: the take returns
+  before the weapon actor exists, and equipping an asset with no instance yet does
+  nothing, which left the weapon in the wheel but not in your hands. The
   Kalash rifle is listed as **Kalash Rifle / AK-47**
   (`DA_Item_AK47`)
 - **AI / Squad tab** - full control over the AI (the headline feature):
