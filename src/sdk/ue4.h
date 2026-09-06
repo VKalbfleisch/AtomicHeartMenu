@@ -73,7 +73,10 @@ namespace UE
         bool        IsA(UObject* cmpClass);  // walks SuperStruct chain
 
         // The universal call gate. params must match the UFunction signature.
-        void        ProcessEvent(UObject* function, void* params);
+        // Returns whether the call was actually dispatched: it refuses rather than
+        // faults on a dead object, so a caller that reports success on a refusal is
+        // reporting work the game never did. Ignoring the result is valid.
+        bool        ProcessEvent(UObject* function, void* params);
     };
 
     using UClass    = UObject;

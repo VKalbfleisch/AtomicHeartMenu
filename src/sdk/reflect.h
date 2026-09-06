@@ -61,4 +61,10 @@ namespace Reflect
     // instance. The class carries the property list, so the offset is readable the
     // moment the class loads, with no instance in existence.
     int FindPropertyOffsetInStruct(UE::UObject* structOrClass, const char* propName);
+
+    // The UClass an object-typed property points at (FObjectPropertyBase::PropertyClass).
+    // Passed a UFunction and a parameter name, this is the game stating what that
+    // parameter will be cast to. Returns nullptr if the property is absent, is not
+    // object-typed, or unreadable.
+    UE::UObject* ObjectPropertyClassInStruct(UE::UObject* structOrClass, const char* propName);
 }

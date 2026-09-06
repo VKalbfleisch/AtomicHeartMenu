@@ -352,6 +352,10 @@ namespace Offsets
         // ESP target: enemy AI characters (AAHAICharacter : AAHBaseCharacter).
         constexpr const char* Cls_AICharacter          = "AtomicHeart.AHAICharacter";
         constexpr const char* Cls_AHBaseCharacter      = "AtomicHeart.AHBaseCharacter";
+        // InstantTakeWeapon / TakeWeapon / EquipWeaponByDataAsset are declared on
+        // it; see PlayerCharacterUsable in features.cpp for why dispatching them
+        // needs a receiver of this class.
+        constexpr const char* Cls_AHPlayerCharacter    = "AtomicHeart.AHPlayerCharacter";
         constexpr const char* Cls_AHAIController       = "AtomicHeart.AHAIController";
         constexpr const char* Cls_AIController         = "AIModule.AIController";
         constexpr const char* Cls_AIBlueprintHelper    = "AIModule.AIBlueprintHelperLibrary";

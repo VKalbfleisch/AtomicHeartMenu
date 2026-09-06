@@ -348,6 +348,30 @@ int Reflect::FindPropertyOffsetInStruct(UObject* structOrClass, const char* prop
     return off;
 }
 
+UObject* Reflect::ObjectPropertyClassInStruct(UObject* structOrClass, const char* propName)
+{
+    try
+    {
+        uint8_t* prop = FindPropertyFieldInStruct(structOrClass, propName, nullptr);
+        if (!prop)
+            return nullptr;
+
+        // PropertyClass sits at the same offset across the FObjectPropertyBase
+        // family but not outside it, so the type name gates the read.
+        std::string type = PropTypeName(prop);
+        if (type != "ObjectProperty" && type != "ClassProperty" &&
+            type != "SoftObjectProperty" && type != "SoftClassProperty" &&
+            type != "WeakObjectProperty" && type != "LazyObjectProperty")
+            return nullptr;
+
+        if (!Mem::IsReadable(prop + R::FObjectProperty_PropClass, sizeof(void*)))
+            return nullptr;
+        UObject* cls = Rd<UObject*>(prop + R::FObjectProperty_PropClass);
+        return Mem::IsReadable(cls, 0x30) ? cls : nullptr;
+    }
+    catch (...) { return nullptr; }
+}
+
 UObject* Reflect::ReadNamedObjectProperty(UObject* obj, const char* propName)
 {
     try

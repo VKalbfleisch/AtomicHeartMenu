@@ -246,10 +246,25 @@ These are wired for the Dumper-7 SDK currently in `dumped-sdk/`:
   miss it also logs the live puzzle-class candidates for diagnosis)
 - **Misc → Unlock current lock / Win active QTE** - one-shot buttons for lock
   bypasses and active QTE passes
-- **Give weapon** - dropdown grants one base weapon via `AAHPlayerCharacter::InstantTakeWeapon`
-  and equips it; **Give all** queues one listed base weapon per tick instead of
-  granting all in one blocking click. The Kalash rifle is listed as
-  **Kalash Rifle / AK-47** (`DA_Item_AK47`)
+- **Give weapon** - dropdown grants one weapon via `AAHPlayerCharacter::InstantTakeWeapon`
+  and equips it; **Give all** paces one listed weapon per tick instead of granting
+  all in one blocking click. Both run **on the game-thread pump**, not from the
+  Present hook: a grant is inventory mutation plus a weapon actor spawn/attach, and
+  dispatching that off the game thread faulted inside the engine and then hung the
+  game (`Skorchekd/AtomicHeartMenu#6`). The buttons
+  therefore report only that the request was accepted; the result is logged a frame
+  or so later. The receiver is checked with `IsA(AHPlayerCharacter)` and the asset
+  against the type the UFunction's own parameter declares, so a non-player pawn or a
+  wrong-class asset is refused instead of dispatched. The **equip is deferred and
+  retried** rather than issued in the same breath as the grant: the take returns
+  before the weapon actor exists, and equipping an asset with no instance yet does
+  nothing, which left the weapon in the wheel but not in your hands. **Weapons with
+  no content in your install are skipped before the grant**: those still take but
+  arrive as named empty storage slots with no model, which crash on equip and wedge
+  weapon switching if selected. The check reads the live asset rather than a
+  hardcoded list, so a patch or a DLC purchase moves the set on its own. The
+  Kalash rifle is listed as **Kalash Rifle / AK-47**
+  (`DA_Item_AK47`)
 - **AI / Squad tab** - full control over the AI (the headline feature):
   - **AI control roster** - a live list of nearby AI. **Tick** units to select them
     (selected + squad units get an in-world **glow box + arrow overhead**), then
@@ -354,8 +369,12 @@ you can trigger from here once the SDK resolves.
   write. Symptoms are subtle rather than loud: the camera desynchronising from the
   character mesh for a frame, or a call like `SetMovementMode` returning having done
   nothing. Marshal that work to the game thread with `QueueGameThread`, which drains
-  inside the `ProcessEvent` hook, the way fly, the teleports and the AI features do.
-  See CONTRIBUTING.md for the full rule.
+  inside the `ProcessEvent` hook, the way fly, the teleports, the weapon grants and
+  the AI features do. When it goes wrong it does not always go wrong loudly: an
+  access violation raised inside engine code unwinds back out through engine frames
+  that were never written to be unwound, so whatever they held is never released and
+  the symptom is a hang rather than a crash. `catch (...)` around a call into game
+  code names the fault; it does not undo it. See CONTRIBUTING.md for the full rule.
 - Native hooks must target a **function entry**, checked with
   `Scanner::IsFunctionEntry` - a hardcoded RVA that a patch has shifted otherwise
   gets a MinHook jump written mid-instruction, rewriting the game's code. Injection
